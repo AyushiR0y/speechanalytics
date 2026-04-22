@@ -1,0 +1,8 @@
+services:
+	- type: web
+		name: bajaj-life-speech-analytics
+		env: python
+		plan: free
+		buildCommand: pip install -r requirements.txt
+		startCommand: cd backend && python -m uvicorn main:app --host 0.0.0.0 --port $PORT
+		autoDeploy: true
