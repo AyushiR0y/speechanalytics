@@ -1,0 +1,31 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.log
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment files
+.env
+.env.*
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated app data and large local artifacts
+uploads/
+processed/
+chroma_db/
+products/
+Product Circulars/
+*.xlsx
+*.xls

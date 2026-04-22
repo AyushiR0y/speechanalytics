@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bajaj Life Insurance — Speech Analytics Platform</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@500;600;700;800&family=Source+Sans+3:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+
+<!-- SIDEBAR -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-mark">
+      <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+        <rect width="12" height="12" rx="3" fill="#005eac"/>
+        <rect x="16" width="12" height="12" rx="3" fill="#005eac" opacity="0.5"/>
+        <rect y="16" width="12" height="12" rx="3" fill="#005eac" opacity="0.5"/>
+        <rect x="16" y="16" width="12" height="12" rx="3" fill="#005eac" opacity="0.25"/>
+      </svg>
+    </div>
+    <div>
+      <div class="logo-title">SpeechIQ</div>
+      <div class="logo-sub">Bajaj Life Insurance</div>
+    </div>
+  </div>
+
+  <nav class="sidebar-nav">
+    <a class="nav-item active" data-view="dashboard" onclick="switchView('dashboard')">
+      <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+      Dashboard
+    </a>
+    <a class="nav-item" data-view="calls" onclick="switchView('calls')">
+      <svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>
+      All Calls
+      <span class="nav-badge" id="total-badge">0</span>
+    </a>
+    <a class="nav-item" data-view="fatal" onclick="switchView('fatal')">
+      <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
+      Fatal & Flagged
+      <span class="nav-badge danger" id="fatal-badge">0</span>
+    </a>
+    <a class="nav-item" data-view="upload" onclick="switchView('upload')">
+      <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+      Upload Calls
+    </a>
+    <a class="nav-item" data-view="products" onclick="switchView('products')">
+      <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14l-5-5 1.41-1.41L12 14.17l7.59-7.59L21 8l-9 9z"/></svg>
+      Product Specs
+    </a>
+    <a class="nav-item" data-view="jobs" onclick="switchView('jobs')">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+      Processing Jobs
+    </a>
+  </nav>
+
+  <div class="sidebar-status">
+    <div class="status-dot" id="status-dot"></div>
+    <span id="status-text">Connecting…</span>
+  </div>
+</aside>
+
+<!-- MAIN CONTENT -->
+<main class="main-content">
+
+  <!-- TOP BAR -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <h1 class="page-title" id="page-title">Dashboard</h1>
+      <div class="page-subtitle" id="page-subtitle">Real-time call quality intelligence</div>
+    </div>
+    <div class="topbar-right">
+      <div class="alert-strip" id="alert-strip" style="display:none">
+        <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2z"/></svg>
+        <span id="alert-text"></span>
+      </div>
+      <button class="btn-icon" onclick="refreshAll()" title="Refresh">
+        <svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0012 4a8 8 0 00-8 8 8 8 0 008 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18a6 6 0 01-6-6 6 6 0 016-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════ DASHBOARD VIEW -->
+  <section class="view active" id="view-dashboard">
+
+    <!-- KPI Row -->
+    <div class="kpi-row">
+      <div class="kpi-card">
+        <div class="kpi-icon blue"><svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg></div>
+        <div class="kpi-body">
+          <div class="kpi-value" id="kpi-total">0</div>
+          <div class="kpi-label">Total Calls</div>
+        </div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-icon green"><svg viewBox="0 0 24 24"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z"/></svg></div>
+        <div class="kpi-body">
+          <div class="kpi-value" id="kpi-score">—</div>
+          <div class="kpi-label">Avg Quality Score</div>
+        </div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-icon blue-light"><svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3z"/></svg></div>
+        <div class="kpi-body">
+          <div class="kpi-value" id="kpi-pass">—%</div>
+          <div class="kpi-label">Pass Rate</div>
+        </div>
+      </div>
+      <div class="kpi-card alert-card">
+        <div class="kpi-icon red"><svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2z"/></svg></div>
+        <div class="kpi-body">
+          <div class="kpi-value" id="kpi-fatal">0</div>
+          <div class="kpi-label">Fatal Rate (target &lt; 20%)</div>
+        </div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-icon orange"><svg viewBox="0 0 24 24"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg></div>
+        <div class="kpi-body">
+          <div class="kpi-value" id="kpi-flagged">0</div>
+          <div class="kpi-label">Flagged Rate (target &lt; 50%)</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Charts Row 1 -->
+    <div class="charts-row row-3col">
+      <div class="chart-card wide">
+        <div class="chart-header">
+          <div class="chart-title">Parameter Performance</div>
+          <div class="chart-sub">Average scores by evaluation dimension</div>
+        </div>
+        <canvas id="chart-radar" height="220"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title">Score Distribution</div>
+        </div>
+        <canvas id="chart-distribution" height="200"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title">Severity Breakdown</div>
+        </div>
+        <canvas id="chart-severity" height="200"></canvas>
+      </div>
+    </div>
+
+    <!-- Charts Row 2 -->
+    <div class="charts-row row-3col">
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title">Call Categories</div>
+        </div>
+        <canvas id="chart-categories" height="200"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-header">
+          <div class="chart-title">Customer Sentiment</div>
+        </div>
+        <canvas id="chart-sentiment" height="200"></canvas>
+      </div>
+      <div class="chart-card wide">
+        <div class="chart-header">
+          <div class="chart-title">Daily Call Volume</div>
+        </div>
+        <canvas id="chart-volume" height="200"></canvas>
+      </div>
+    </div>
+
+    <!-- Bottom Row -->
+    <div class="charts-row row-bottom">
+      <div class="chart-card medium">
+        <div class="chart-header">
+          <div class="chart-title">Flag Breakdown</div>
+          <div class="chart-sub">Issues detected across calls</div>
+        </div>
+        <div id="flags-breakdown" class="flags-list"></div>
+      </div>
+      <div class="chart-card medium">
+        <div class="chart-header">
+          <div class="chart-title">Recent Fatal Calls</div>
+          <button class="btn-link" onclick="switchView('fatal')">View All →</button>
+        </div>
+        <div id="recent-fatals" class="fatals-list"></div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════ ALL CALLS VIEW -->
+  <section class="view" id="view-calls">
+
+    <div class="table-toolbar">
+      <div class="search-box">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+        <input type="text" placeholder="Search calls, transcripts…" id="call-search" oninput="debounceSearch()">
+      </div>
+      <div class="filter-group">
+        <select id="filter-severity" onchange="loadCalls()">
+          <option value="">All Severities</option>
+          <option value="fatal">Fatal</option>
+          <option value="critical">Critical</option>
+          <option value="watch">Watch</option>
+          <option value="normal">Normal</option>
+        </select>
+        <select id="filter-category" onchange="loadCalls()">
+          <option value="">All Categories</option>
+          <option value="Policy Inquiry">Policy Inquiry</option>
+          <option value="Claims Assistance">Claims Assistance</option>
+          <option value="Premium Payment">Premium Payment</option>
+          <option value="Policy Renewal">Renewal</option>
+          <option value="New Policy">New Policy</option>
+          <option value="Grievance">Grievance</option>
+          <option value="Technical Issue">Technical Issue</option>
+          <option value="General Query">General Query</option>
+          <option value="Escalation Request">Escalation</option>
+          <option value="Cancellation Request">Cancellation</option>
+        </select>
+        <select id="filter-sentiment" onchange="loadCalls()">
+          <option value="">All Sentiments</option>
+          <option value="positive">Positive</option>
+          <option value="neutral">Neutral</option>
+          <option value="frustrated">Frustrated</option>
+          <option value="angry">Angry</option>
+          <option value="distressed">Distressed</option>
+        </select>
+        <select id="filter-pf" onchange="loadCalls()">
+          <option value="">Pass & Fail</option>
+          <option value="PASS">Pass</option>
+          <option value="FAIL">Fail</option>
+        </select>
+      </div>
+      <button class="btn-danger" onclick="deleteAllCalls()">Delete All Calls</button>
+      <button class="btn-muted" onclick="downloadCallsExcel()">Download Excel</button>
+      <div class="table-count" id="table-count">— calls</div>
+    </div>
+
+    <div class="table-wrapper">
+      <table class="calls-table" id="calls-table">
+        <thead>
+          <tr>
+            <th>Call / SL</th>
+            <th>Category</th>
+            <th class="sortable" onclick="sortTable('weighted_score')">Score ↕</th>
+            <th>Pass/Fail</th>
+            <th>Severity</th>
+            <th>Sentiment</th>
+            <th>Product</th>
+            <th>Duration</th>
+            <th>Flags</th>
+            <th>Time</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="calls-tbody">
+          <tr class="empty-row"><td colspan="11">Upload transcripts to begin analysis</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pagination" id="pagination"></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════ FATAL VIEW -->
+  <section class="view" id="view-fatal">
+    <div class="fatal-banner">
+      <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2zm0 3.5L20.5 19h-17L12 5.5zM11 10v4h2v-4h-2zm0 6v2h2v-2h-2z"/></svg>
+      <span>These calls require immediate attention — review and take action</span>
+    </div>
+    <div id="fatal-grid" class="fatal-grid"></div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════ UPLOAD VIEW -->
+  <section class="view" id="view-upload">
+    <div class="upload-layout">
+      <div class="upload-panel">
+        <div class="upload-zone" id="upload-zone"
+             ondrop="handleDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)">
+          <div class="upload-icon">
+            <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+          </div>
+          <div class="upload-text">
+            <strong>Drop files or folders here</strong>
+            <span>Supports Word (.docx), Excel (.xlsx), PDF (.pdf), Text (.txt)</span>
+            <span>Multiple files • Multiple transcripts per file • Excel with SL column</span>
+          </div>
+          <label class="btn-primary upload-btn">
+            <input type="file" id="file-input" multiple accept=".pdf,.docx,.xlsx,.xls,.txt" onchange="handleFileSelect(event)" style="display:none">
+            Browse Files
+          </label>
+        </div>
+
+        <div class="upload-format-guide">
+          <h3>Supported Formats</h3>
+          <div class="format-grid">
+            <div class="format-item">
+              <div class="format-icon pdf">PDF</div>
+              <div>Multiple calls separated by dividers or headers</div>
+            </div>
+            <div class="format-item">
+              <div class="format-icon docx">DOCX</div>
+              <div>Single or multiple transcripts in one document</div>
+            </div>
+            <div class="format-item">
+              <div class="format-icon xlsx">XLSX</div>
+              <div>SL column + Transcript column • One row per call</div>
+            </div>
+            <div class="format-item">
+              <div class="format-icon txt">TXT</div>
+              <div>Raw transcript text • Bot/Customer labels required</div>
+            </div>
+          </div>
+          <div class="transcript-example">
+            <div class="example-label">Expected transcript format:</div>
+            <pre>1. bot:
+"Good evening! Welcome to Bajaj Life Insurance. How can I help you today?"
+
+2. customer:
+"I want to know about my policy renewal."</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="upload-sidebar">
+        <div class="upload-files-list" id="upload-files-list">
+          <div class="upload-placeholder">
+            <svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm4 18H6V4h7v5h5v11z"/></svg>
+            <span>No files selected</span>
+          </div>
+        </div>
+        <button class="btn-primary btn-full" id="upload-btn" onclick="submitUpload()" disabled>
+          <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+          Analyze Calls
+        </button>
+        <div class="upload-progress" id="upload-progress" style="display:none">
+          <div class="progress-label">
+            <span id="progress-text">Processing…</span>
+            <span id="progress-pct">0%</span>
+          </div>
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════ PRODUCTS VIEW -->
+  <section class="view" id="view-products">
+    <div class="products-layout">
+      <div class="products-left">
+        <div class="upload-zone small" id="product-zone"
+             ondrop="handleProductDrop(event)" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)">
+          <div class="upload-icon small">
+            <svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm4 18H6V4h7v5h5v11z"/></svg>
+          </div>
+          <div class="upload-text">
+            <strong>Upload Product Spec PDFs</strong>
+            <span>These will be indexed into the RAG knowledge base</span>
+          </div>
+          <label class="btn-primary upload-btn">
+            <input type="file" id="product-input" multiple accept=".pdf" onchange="handleProductSelect(event)" style="display:none">
+            Browse PDFs
+          </label>
+        </div>
+
+        <div class="products-charts">
+          <div class="chart-card medium">
+            <div class="chart-header">
+              <div>
+                <div class="chart-title">Product Mix</div>
+                <div class="chart-sub">Calls grouped by inferred product</div>
+              </div>
+            </div>
+            <canvas id="chart-products" height="260"></canvas>
+          </div>
+          <div class="chart-card medium">
+            <div class="chart-header">
+              <div>
+                <div class="chart-title">Product Confidence</div>
+                <div class="chart-sub">Average inference confidence by product</div>
+              </div>
+            </div>
+            <canvas id="chart-product-confidence" height="260"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <div class="products-info">
+        <h3>Product Knowledge Base (RAG)</h3>
+        <p>Upload Bajaj Life Insurance product specification PDFs. These are embedded using an open-source sentence transformer model and indexed in a local FAISS store. During call analysis, product cues are inferred from transcript content and matched to product facts for stronger quality checks.</p>
+        <div class="rag-status">
+          <div class="rag-icon">🧠</div>
+          <div>
+            <strong>Embedding Model:</strong> all-MiniLM-L6-v2 (open-source)<br>
+            <strong>Vector Store:</strong> FAISS (local persistent)<br>
+            <strong>Retrieval:</strong> Top-5 chunks per product query
+          </div>
+        </div>
+        <div class="specs-panel">
+          <div class="specs-header-row">
+            <h4>Uploaded Product Specs</h4>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+              <button class="btn-link" onclick="loadProductSpecs()">Refresh list</button>
+              <button class="btn-muted" onclick="deleteAllProductSpecs()">Delete All Specs</button>
+            </div>
+          </div>
+          <div id="product-specs-list" class="product-specs-list">
+            <div class="empty-specs">No product specs uploaded yet</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════════ JOBS VIEW -->
+  <section class="view" id="view-jobs">
+    <div id="jobs-list" class="jobs-list"></div>
+  </section>
+
+</main>
+
+<!-- ═══════════════════════════════════════════════════════ CALL DETAIL MODAL -->
+<div class="modal-overlay" id="call-modal" onclick="closeModal(event)">
+  <div class="modal" id="modal-content">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="modal-title">Call Detail</div>
+        <div class="modal-meta" id="modal-meta"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-muted" id="prev-report-btn" type="button" aria-label="Previous report">◀</button>
+        <span class="modal-carousel-meta" id="report-position">1 / 1</span>
+        <button class="btn-muted" id="next-report-btn" type="button" aria-label="Next report">▶</button>
+        <button class="btn-muted" id="download-report-btn" type="button">Download PDF</button>
+        <button class="btn-danger" id="delete-call-btn" type="button">Delete Call</button>
+        <button class="modal-close" onclick="closeCallModal()">✕</button>
+      </div>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast" class="toast"></div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
