@@ -167,9 +167,9 @@ def _fallback_param_comments(scores: Dict[str, Any]) -> List[str]:
     text = {
         "greeting_opening": "Opening tone and welcome quality from the first bot turn.",
         "query_understanding": "How accurately the bot interpreted customer intent and follow-up questions.",
-        "response_accuracy": "Factual correctness of product/policy information provided by the bot.",
+        "response_accuracy": "Factual correctness of product/policy information provided by the bot; wrong product facts are fatal.",
         "communication_quality": "Clarity, structure, and readability of the bot's language.",
-        "compliance": "Compliance with privacy, OTP, and regulatory constraints in the flow.",
+        "compliance": "Compliance with privacy, OTP, regulatory constraints, and staying on-product for the question asked.",
         "personalisation": "Use of customer context, policy context, and personalization cues.",
         "empathy_soft_skills": "Warmth, reassurance, and acknowledgement of customer concerns.",
         "resolution": "Whether the customer issue was actually solved or moved forward.",
@@ -258,6 +258,218 @@ def _build_qa_findings(analysis: Dict[str, Any]) -> List[Dict[str, str]]:
     if not findings:
         findings.append({"type": "positive", "text": "No major QA issues detected in automated analysis."})
     return findings[:8]
+
+
+def _sentence_split(text: str) -> List[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text or "") if part.strip()]
+
+
+def _normalize_number_token(token: str) -> str:
+    token = (token or "").strip().lower().rstrip("%")
+    try:
+        value = float(token)
+        return str(int(value)) if value.is_integer() else f"{value:.2f}".rstrip("0").rstrip(".")
+    except Exception:
+        return token
+
+
+def _extract_number_tokens(text: str) -> List[str]:
+    return [_normalize_number_token(token) for token in re.findall(r"\d+(?:\.\d+)?%?", text or "")]
+
+
+def _bot_sentences(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sentences: List[Dict[str, Any]] = []
+    for turn in turns or []:
+        speaker = (turn.get("speaker") or "").lower()
+        if speaker not in {"bot", "agent", "system"}:
+            continue
+        for sentence in _sentence_split(turn.get("text", "")):
+            sentences.append({"sl": turn.get("sl"), "speaker": speaker, "text": sentence})
+    return sentences
+
+
+def _best_spec_sentence(statement: str, analysis: Dict[str, Any], keywords: List[str]) -> str:
+    candidates: List[tuple] = []
+    search_rows = list(analysis.get("product_evidence") or [])
+    profile = analysis.get("product_profile") or {}
+    search_texts = [row.get("text", "") for row in search_rows if row.get("text")]
+    search_texts.extend(profile.get("evidence_snippets") or [])
+    if profile.get("summary"):
+        search_texts.append(profile.get("summary"))
+
+    stmt_tokens = set(_tokenize(statement))
+    for text in search_texts:
+        for sentence in _sentence_split(text):
+            sentence_lower = sentence.lower()
+            overlap = len(stmt_tokens.intersection(_tokenize(sentence)))
+            keyword_hits = sum(1 for keyword in keywords if keyword in sentence_lower)
+            score = overlap + (2 * keyword_hits)
+            if score > 0:
+                candidates.append((score, sentence.strip()))
+
+    if not candidates:
+        return (profile.get("summary") or "").strip()[:260]
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _classify_product_check(statement: str, fact: str, keywords: List[str]) -> tuple:
+    stmt_lower = statement.lower()
+    fact_lower = fact.lower()
+    stmt_nums = _extract_number_tokens(statement)
+    fact_nums = _extract_number_tokens(fact)
+
+    if any(phrase in stmt_lower for phrase in ["unable to provide information", "cannot provide information", "can't provide information", "not able to provide information"]):
+        return "risk", "⚠️ Medium — evasive response on a product or policy question"
+
+    if stmt_nums:
+        if fact_nums and not set(stmt_nums).intersection(fact_nums):
+            return "fail", "🚨 HIGH — numeric detail conflicts with the product specification"
+        if not fact_nums:
+            return "risk", "⚠️ Medium — numeric detail is not explicit in the supporting product sentence"
+
+    if any(word in stmt_lower for word in ["guaranteed", "only", "always", "never", "free", "must"]) and not any(keyword in fact_lower for keyword in keywords):
+        return "risk", "⚠️ Medium — categorical claim needs direct product-spec support"
+
+    overlap = len(set(_tokenize(statement)).intersection(_tokenize(fact)))
+    if overlap < 3:
+        return "risk", "⚠️ Medium — supporting product sentence is indirect"
+
+    return "pass", "None"
+
+
+def _build_product_checks(turns: List[Dict[str, Any]], analysis: Dict[str, Any]) -> List[Dict[str, str]]:
+    product_name = str(analysis.get("product_mentioned") or "None").strip()
+    if not product_name or product_name == "None":
+        return []
+
+    bot_sentences = _bot_sentences(turns)
+    topic_map = [
+        ("policy_term_eligibility", ["policy term", "entry age", "maturity age", "eligibility", "age at maturity", "sum assured"]),
+        ("premium_payment", ["premium", "monthly", "quarterly", "half-yearly", "half yearly", "yearly", "auto-debit", "modal premium"]),
+        ("benefits", ["maturity benefit", "death benefit", "guaranteed additions", "sum assured", "payout", "cover"]),
+        ("surrender_loan", ["surrender", "loan", "paid-up", "grace period", "revival", "foreclosure"]),
+    ]
+
+    checks: List[Dict[str, str]] = []
+    for topic_name, keywords in topic_map:
+        statement_item = next((item for item in bot_sentences if any(keyword in item["text"].lower() for keyword in keywords)), None)
+        if not statement_item:
+            continue
+
+        statement = statement_item["text"].strip()
+        fact = _best_spec_sentence(statement, analysis, keywords)
+        if not fact:
+            continue
+
+        verdict, risk = _classify_product_check(statement, fact, keywords)
+        checks.append({
+            "call": str(analysis.get("call_id", "")),
+            "stmt": statement,
+            "fact": fact,
+            "verdict": verdict,
+            "vtext": "✓ ACCURATE" if verdict == "pass" else ("⚠️ CONDITIONALLY OK" if verdict == "risk" else "✗ INACCURATE"),
+            "risk": risk,
+            "topic": topic_name,
+        })
+
+        if len(checks) >= 4:
+            break
+
+    return checks
+
+
+def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    analysis = dict(analysis or {})
+    scores = dict(analysis.get("scores") or {})
+    flags = list(dict.fromkeys(analysis.get("flags") or []))
+    failed_parameters = list(dict.fromkeys(analysis.get("failed_parameters") or []))
+
+    generated_checks = _build_product_checks(turns, analysis)
+    existing_checks = list(analysis.get("product_checks") or [])
+    merged_checks = []
+    seen_pairs = set()
+    for check in existing_checks + generated_checks:
+        key = (
+            (check.get("stmt") or "").strip().lower(),
+            (check.get("fact") or "").strip().lower(),
+        )
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        merged_checks.append(check)
+    analysis["product_checks"] = merged_checks[:6]
+
+    product_checks = analysis.get("product_checks") or []
+    hard_fail = any(check.get("verdict") == "fail" for check in product_checks)
+    risk_only = any(check.get("verdict") == "risk" for check in product_checks)
+    product_query = any(
+        any(keyword in (turn.get("text", "").lower()) for keyword in ["policy", "product", "premium", "sum assured", "maturity", "surrender", "loan", "coverage", "term"])
+        for turn in turns
+    )
+    unable_response = any(
+        phrase in (turn.get("text", "").lower())
+        for turn in turns
+        if (turn.get("speaker") or "").lower() in {"bot", "agent", "system"}
+        for phrase in ["unable to provide information", "cannot provide information", "can't provide information", "not able to provide information"]
+    )
+
+    if hard_fail:
+        analysis["severity"] = "fatal"
+        analysis["fatal_reason"] = analysis.get("fatal_reason") or next(
+            (check.get("risk", "").replace("⚠️ Medium — ", "").replace("🚨 HIGH — ", "") for check in product_checks if check.get("verdict") == "fail"),
+            "Incorrect product or policy information was provided."
+        )
+        analysis["product_accuracy_score"] = 0
+        analysis["product_issues"] = "; ".join(
+            f"{check.get('stmt', '')} -> {check.get('fact', '')}"
+            for check in product_checks if check.get("verdict") == "fail"
+        ) or "Incorrect product or policy information was provided."
+        flags.extend(["false_information", "compliance_breach", "regulatory_violation"])
+        scores["response_accuracy"] = min(int(scores.get("response_accuracy", 5) or 5), 1)
+        scores["compliance"] = min(int(scores.get("compliance", 5) or 5), 1)
+        if "response_accuracy" not in failed_parameters:
+            failed_parameters.append("response_accuracy")
+        if "compliance" not in failed_parameters:
+            failed_parameters.append("compliance")
+        analysis["pass_fail"] = "FAIL"
+    elif risk_only:
+        current_accuracy = int(scores.get("response_accuracy", 3) or 3)
+        scores["response_accuracy"] = min(current_accuracy, 3)
+        if not analysis.get("product_issues") or analysis.get("product_issues") in {"None", ""}:
+            analysis["product_issues"] = "Unconfirmed product information should be verified against the product specification before answering as fact."
+        if analysis.get("product_accuracy_score") in {None, "", 0}:
+            analysis["product_accuracy_score"] = 3
+        if product_query and "escalation_needed" not in flags:
+            flags.append("escalation_needed")
+
+    if unable_response and product_query:
+        if int(scores.get("system_behaviour", 3) or 3) > 2:
+            scores["system_behaviour"] = 2
+        if int(scores.get("compliance", 3) or 3) > 2:
+            scores["compliance"] = 2
+        if "unresolved_critical" not in flags:
+            flags.append("unresolved_critical")
+        if "escalation_needed" not in flags:
+            flags.append("escalation_needed")
+
+    analysis["scores"] = scores
+    analysis["flags"] = flags
+    analysis["failed_parameters"] = failed_parameters
+    analysis["qa_findings"] = _build_qa_findings({**analysis, "transcript": turns})
+    analysis["score_reason"] = _score_reason(analysis)
+    if not analysis.get("product_accuracy_score") and product_checks:
+        analysis["product_accuracy_score"] = 5 if not risk_only and not hard_fail else 3
+    if not analysis.get("product_issues"):
+        analysis["product_issues"] = "None"
+    if analysis.get("severity") == "fatal" and not analysis.get("fatal_reason"):
+        analysis["fatal_reason"] = "Incorrect product or policy information was provided."
+    if analysis.get("severity") not in {"fatal", "critical", "watch", "normal"}:
+        analysis["severity"] = "watch"
+    if analysis.get("pass_fail") not in {"PASS", "FAIL"}:
+        analysis["pass_fail"] = "FAIL" if failed_parameters else "PASS"
+    return analysis
 
 
 PRODUCT_FEATURE_KEYWORDS = {
@@ -722,14 +934,14 @@ You must think like a strict insurance QA lead, not a generic chatbot. Use the t
 
 EVALUATION PARAMETERS (score each 1-5):
 1. greeting_opening (Weight: 5%, Min pass: 3) - Polite greeting, professional tone, respectful language
-2. query_understanding (Weight: 15%, Min pass: 3) - Correct interpretation of customer intent, clarification when needed
+2. query_understanding (Weight: 10%, Min pass: 3) - Correct interpretation of customer intent, clarification when needed
 3. response_accuracy (Weight: 25%, Min pass: 4) - Factual correctness, no guessing, no contradictions, reliable info
-4. communication_quality (Weight: 10%, Min pass: 3) - Clear sentences, well-organized, avoids jargon, structured
+4. communication_quality (Weight: 8%, Min pass: 3) - Clear sentences, well-organized, avoids jargon, structured
 5. compliance (Weight: 20%, Min pass: 4) - Follows regulatory rules (insurance/finance/privacy), no restricted info shared, no outcome promises
 6. personalisation (Weight: 5%, Min pass: 3) - Uses available info (name, SR no, context) within compliance limits
 7. empathy_soft_skills (Weight: 5%, Min pass: 3) - Acknowledges feelings, warm language, avoids robotic responses
 8. resolution (Weight: 10%, Min pass: 3) - Directly solves problem, clear guidance, alternatives offered
-9. system_behaviour (Weight: 3%, Min pass: 3) - No loops, no latency issues, no errors, appropriate escalation
+9. system_behaviour (Weight: 10%, Min pass: 3) - No loops, no latency issues, no errors, appropriate escalation
 10. closing_interaction (Weight: 2%, Min pass: 3) - Polite closure, thanks customer, offers further help
 
 PRODUCT EVALUATION:
@@ -740,6 +952,10 @@ PRODUCT EVALUATION:
 - Note any product information gaps, invented facts, or contradictions
 - Note what should have been said differently if the bot missed a product-specific rule or detail
 - Include 2-4 product checks with exact bot statement, supporting fact from the knowledge base, and verdict
+- If the bot gives incorrect product or policy information, treat it as a fatal QA defect and score product accuracy 0
+- If the bot states unconfirmed product information, mark it as a risk and lower confidence instead of passing it
+- If the bot says it is unable to provide information for a policy/product question, flag it as a system failure and lower the relevant QA scores
+- Every product check must compare the call statement against an exact sentence from the product PDF or indexed product spec
 
 CALL CLASSIFICATION:
 - category: One of [Policy Inquiry, Claims Assistance, Premium Payment, Policy Renewal, New Policy, Grievance, Technical Issue, General Query, Escalation Request, Cancellation Request]
@@ -812,6 +1028,8 @@ async def analyze_call_with_gpt4o(transcript_text: str, turns: List[Dict], produ
 {product_section}
 
 Evaluate all parameters and return ONLY the JSON response.
+
+Treat product accuracy as a strict QA test: include exact call-vs-spec comparison rows for any product or policy claim, and fail closed on unconfirmed facts.
 
 Ensure param_comments contains exactly 10 entries in score order and each entry clearly explains the score using transcript evidence so it can be shown in hover tooltips."""
 
@@ -946,8 +1164,7 @@ async def process_job(job_id: str, file_paths: List[Path]):
             analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
             if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
                 analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
-            analysis["score_reason"] = _score_reason(analysis)
-            analysis["qa_findings"] = _build_qa_findings(analysis)
+            analysis = _apply_qa_policy_rules(analysis, turns)
             analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
             
             call_record = {
@@ -1155,12 +1372,12 @@ async def get_calls(
         a = c["analysis"]
         if not a.get("param_comments") or len(a.get("param_comments", [])) < len(PARAM_ORDER):
             a["param_comments"] = _fallback_param_comments(a.get("scores", {}))
-        if not a.get("qa_findings"):
-            a["qa_findings"] = _build_qa_findings(a)
         if not a.get("annotated_transcript"):
             a["annotated_transcript"] = _annotate_transcript(c.get("transcript", []), a)
         a["sentiment"] = _refine_sentiment(c.get("transcript", []), a.get("sentiment", "neutral"))
+        a = _apply_qa_policy_rules(a, c.get("transcript", []))
         a["product_mentioned"] = _safe_filename_label(str(a.get("product_mentioned") or "None"))
+        c["analysis"] = a
         failed_parameters = a.get("failed_parameters", [])
         score_reason = a.get("score_reason") or _score_reason(a)
         slim.append({
@@ -1196,13 +1413,12 @@ async def get_call_detail(call_id: str):
     a = call.get("analysis", {})
     if not a.get("param_comments") or len(a.get("param_comments", [])) < len(PARAM_ORDER):
         a["param_comments"] = _fallback_param_comments(a.get("scores", {}))
-    if not a.get("qa_findings"):
-        a["qa_findings"] = _build_qa_findings(a)
     if not a.get("annotated_transcript"):
         a["annotated_transcript"] = _annotate_transcript(call.get("transcript", []), a)
     a["sentiment"] = _refine_sentiment(call.get("transcript", []), a.get("sentiment", "neutral"))
-    a["score_reason"] = a.get("score_reason") or _score_reason(a)
+    a = _apply_qa_policy_rules(a, call.get("transcript", []))
     a["product_mentioned"] = _safe_filename_label(str(a.get("product_mentioned") or "None"))
+    call["analysis"] = a
     return call
 
 
