@@ -246,7 +246,7 @@ def _score_reason(analysis: Dict[str, Any]) -> str:
 
 def _refine_sentiment(turns: List[Dict], model_sentiment: str = "neutral") -> str:
     customer_text = " ".join(t.get("text", "") for t in turns if t.get("speaker") in {"customer", "user"}).lower()
-    bot_text = " ".join(t.get("text", "") for t in turns if t.get("speaker") in {"bot", "agent", "system"}).lower()
+    bot_text = " ".join(t.get("text", "") for t in turns if t.get("speaker") in {"bot", "agent", "system", "assistant"}).lower()
 
     distress_words = ["urgent", "panic", "scared", "emergency", "distress", "anxious"]
     angry_words = ["angry", "worst", "terrible", "frustrated", "complaint", "unacceptable", "ridiculous"]
@@ -905,7 +905,7 @@ def parse_transcript_text(raw: str) -> List[Dict]:
     # Pattern: optional SL number, speaker label, colon, then quoted or unquoted text
     pattern = re.compile(
         r'(?:(\d+)\.\s+)?'           # optional SL no
-        r'(bot|agent|customer|user|ivr|system)[:\s]+'  # speaker
+        r'(bot|agent|assistant|customer|user|ivr|system)[:\s]+'  # speaker
         r'["\u201c]?(.+?)["\u201d]?(?=(?:\d+\.)?\s*(?:bot|agent|customer|user|ivr|system)[:\s]|$)',
         re.IGNORECASE | re.DOTALL
     )
@@ -1040,7 +1040,7 @@ PRODUCT EVALUATION:
 - Every product check must compare the call statement against an exact sentence from the product PDF or indexed product spec
 
 CALL CLASSIFICATION:
-- category: One of [Policy Inquiry, Claims Assistance, Premium Payment, Policy Renewal, New Policy, Grievance, Technical Issue, General Query, Escalation Request, Cancellation Request]
+- category: One of [Premium Receipt, Premium Payment Assistance, Policy Status Inquiry, Policy Document Request, Surrender Request, Loan Against Policy, Nominee Update, Address or Contact Update, Maturity Claim, Death Claim, Revival of Lapsed Policy, Free Look Cancellation, Rider Inquiry, Fund Switch or Redirection, Partial Withdrawal, Benefit Illustration Request, Complaint or Grievance, Escalation Request, General Inquiry]
 - severity: "normal", "watch", "critical", "fatal"
 - fatal_reason: explain if fatal (empty string otherwise)
 - flags: array of ONLY actual violations: ["compliance_breach", "false_information", "regulatory_violation"] for critical issues. DO NOT flag routine statements, customer observations, or normal bot responses. ONLY flag if the bot actually violated compliance rules, gave factually incorrect product info, or exhibited problematic behavior
@@ -1219,6 +1219,83 @@ def _mock_analysis(turns: List[Dict]) -> Dict:
     }
 
 # ── Processing Pipeline ──────────────────────────────────────────────────────
+async def process_realtime_call(job_id: str, item: dict):
+    """Process a single real-time call item (already parsed)."""
+    db = load_db()
+    job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+    if job_idx is None:
+        return
+    db["jobs"][job_idx]["status"] = "processing"
+    save_db(db)
+
+    try:
+        # Use pre-parsed turns if available, otherwise parse from text
+        turns = item.get("turns") or parse_transcript_text(item["text"])
+        meta = item.get("meta", {})
+
+        rag_hit = infer_product_context(item["text"])
+        product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
+        detected_product = rag_hit.get("product", "None")
+        if detected_product and detected_product != "None":
+            product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
+
+        analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
+
+        # --- Overlay voicebot metadata where available ---
+        if meta.get("intent"):
+            analysis["voicebot_intent"] = meta["intent"]
+        if meta.get("summary") and meta["summary"].strip():
+            analysis["summary"] = meta["summary"].strip()
+        if meta.get("no_of_queries") is not None:
+            analysis["no_of_queries"] = meta["no_of_queries"]
+        if meta.get("no_of_queries_resolved") is not None:
+            analysis["no_of_queries_resolved"] = meta["no_of_queries_resolved"]
+        if meta.get("customer_journey"):
+            analysis["customer_journey"] = meta["customer_journey"]
+        if meta.get("standalone_type"):
+            # Use voicebot's standalone_type as category if available
+            analysis["category"] = meta["standalone_type"][0] if meta["standalone_type"] else analysis.get("category", "General Query")
+            analysis["standalone_type"] = meta["standalone_type"]
+        if meta.get("sub_query_type"):
+            analysis["sub_query_type"] = meta["sub_query_type"]
+        if meta.get("call_comp_flag"):
+            analysis["call_comp_flag"] = meta["call_comp_flag"]
+        if meta.get("audio_link"):
+            analysis["audio_link"] = meta["audio_link"]
+            
+        call_record = {
+            "id": str(uuid.uuid4()),
+            "job_id": job_id,
+            "name": item["name"],
+            "sl": item.get("sl", ""),
+            "source_file": "realtime",
+            "transcript": turns,
+            "raw_text": item["text"][:5000],
+            "analysis": analysis,
+            "processed_at": datetime.now().isoformat(),
+            "flagged": len(analysis.get("flags", [])) > 0,
+            "fatal": analysis.get("severity") == "fatal"
+        }
+
+        db = load_db()
+        db["calls"].append(call_record)
+        job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+        if job_idx is not None:
+            db["jobs"][job_idx]["processed"] = 1
+            db["jobs"][job_idx]["status"] = "completed"
+            db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
+            db["jobs"][job_idx]["fatal_count"] = 1 if call_record["fatal"] else 0
+            db["jobs"][job_idx]["flag_count"] = 1 if call_record["flagged"] else 0
+        save_db(db)
+
+    except Exception as e:
+        log.error(f"Realtime call processing error: {e}")
+        db = load_db()
+        job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+        if job_idx is not None:
+            db["jobs"][job_idx]["status"] = "completed"
+            db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
+        save_db(db)
 
 async def process_job(job_id: str, file_paths: List[Path]):
     db = load_db()
@@ -1337,6 +1414,72 @@ async def upload_files(background_tasks: BackgroundTasks, files: List[UploadFile
     
     background_tasks.add_task(process_job, job_id, saved_paths)
     return {"job_id": job_id, "files_received": len(files), "status": "queued"}
+from fastapi import Request
+
+@app.post("/api/ingest-call")
+async def ingest_realtime_call(request: Request, background_tasks: BackgroundTasks):
+    """Receive a real-time call payload in the voicebot API format."""
+    payload = await request.json()
+
+    # Map conversation_log roles to your internal speaker format
+    role_map = {"assistant": "bot", "user": "customer"}
+    turns = []
+    for i, msg in enumerate(payload.get("conversation_log", []), start=1):
+        turns.append({
+            "sl": i,
+            "speaker": role_map.get(msg.get("role", "user"), "unknown"),
+            "text": (msg.get("content") or "").strip()
+        })
+
+    call_name = payload.get("unique_call_id", str(uuid.uuid4()))
+    raw_text = "\n".join(
+        f"{t['speaker']}: {t['text']}" for t in turns
+    )
+
+    # Create a synthetic job for this single call
+    job_id = str(uuid.uuid4())
+    db = load_db()
+    db["jobs"].append({
+        "id": job_id,
+        "status": "queued",
+        "files": [f"realtime:{call_name}"],
+        "total": 1,
+        "processed": 0,
+        "fatal_count": 0,
+        "flag_count": 0,
+        "created_at": datetime.now().isoformat(),
+        "completed_at": None
+    })
+    save_db(db)
+
+    # Pass extra metadata from the payload into the item
+    item = {
+        "name": call_name,
+        "text": raw_text,
+        "sl": payload.get("unique_call_id", ""),
+        "source_file": "realtime",
+        "turns": turns,                          # pre-parsed, skip re-parsing
+        "meta": {
+            "intent": payload.get("INTENT"),
+            "stage_code": payload.get("STAGE_CODE"),
+            "sentiment": payload.get("sentiment"),
+            "summary": payload.get("conversation_summary"),
+            "no_of_queries": payload.get("no_of_queries"),
+            "no_of_queries_resolved": payload.get("no_of_queries_resolved"),
+            "call_comp_flag": payload.get("call_comp_flag"),
+            "customer_journey": payload.get("customer_journey", []),
+            "standalone_type": payload.get("standalone_type", []),
+            "sub_query_type": payload.get("sub_query_type", []),
+            "root_dscn": payload.get("root_dscn"),
+            "mid_dscn": payload.get("mid_dscn"),
+            "root_tta": payload.get("root_tta"),
+            "mid_tta": payload.get("mid_tta"),
+            "audio_link": payload.get("audio_link", ""),
+        }
+    }
+
+    background_tasks.add_task(process_realtime_call, job_id, item)
+    return {"job_id": job_id, "call_id": call_name, "status": "queued"}
 
 @app.post("/api/upload-products")
 async def upload_product_specs(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
