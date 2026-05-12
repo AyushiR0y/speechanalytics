@@ -168,7 +168,7 @@ def clear_expired_cache():
         log.warning(f"Cache cleanup error: {e}")
 
 
-
+def _load_embedder():
     if hasattr(_load_embedder, "_model"):
         return _load_embedder._model
     try:
