@@ -222,7 +222,7 @@ def _fallback_param_comments(scores: Dict[str, Any]) -> List[str]:
         "query_understanding": "How accurately the bot interpreted customer intent and follow-up questions.",
         "response_accuracy": "Factual correctness of product/policy information provided by the bot; wrong product facts are fatal.",
         "communication_quality": "Clarity, structure, and readability of the bot's language.",
-        "compliance": "Compliance with privacy, OTP, regulatory constraints, and staying on-product for the question asked.",
+        "compliance": "Compliance with privacy, regulatory constraints, and staying on-product for the question asked.",
         "personalisation": "Use of customer context, policy context, and personalization cues.",
         "empathy_soft_skills": "Warmth, reassurance, and acknowledgement of customer concerns.",
         "resolution": "Whether the customer issue was actually solved or moved forward.",
@@ -238,11 +238,10 @@ def _fallback_param_comments(scores: Dict[str, Any]) -> List[str]:
 
 
 def _score_reason(analysis: Dict[str, Any]) -> str:
-    summary = (analysis.get("summary") or "").strip()
     failed = analysis.get("failed_parameters") or []
     if failed:
-        return f"{summary} Failed parameters: {', '.join(failed)}.".strip()
-    return summary or "Weighted score computed from parameter scores and policy thresholds."
+        return f"Failed parameters: {', '.join(failed)}.".strip()
+    return "Weighted score computed from parameter scores and policy thresholds."
 
 
 def _refine_sentiment(turns: List[Dict], model_sentiment: str = "neutral") -> str:
@@ -469,26 +468,33 @@ def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]
     )
 
     if hard_fail:
-        analysis["severity"] = "fatal"
-        analysis["fatal_reason"] = analysis.get("fatal_reason") or next(
-            (check.get("risk", "").replace("⚠️ Medium — ", "").replace("🚨 HIGH — ", "") for check in product_checks if check.get("verdict") == "fail"),
-            "Incorrect product or policy information was provided."
-        )
-        analysis["product_accuracy_score"] = 0
+        # Product checks failed (missing or incorrect info)
+        # Only mark as FATAL if false_information or behavior_issue flags exist
+        has_fatal_flag = "false_information" in flags or "behavior_issue" in flags
+        if has_fatal_flag:
+            analysis["severity"] = "fatal"
+            analysis["fatal_reason"] = "Call contains false product information or significant behavior issues."
+            analysis["product_accuracy_score"] = 0
+        else:
+            # Missing/unconfirmed info is a watch item, not fatal
+            analysis["severity"] = "watch"
+            analysis["product_accuracy_score"] = 2
+        
         analysis["product_issues"] = "; ".join(
             f"{check.get('stmt', '')} -> {check.get('fact', '')}"
             for check in product_checks if check.get("verdict") == "fail"
-        ) or "Incorrect product or policy information was provided."
+        ) or "Product information contains inaccuracies or unconfirmed details."
+        
         # Only add flag if not already present (dedup check)
         if "false_information" not in flags:
             flags.append("false_information")
-        scores["response_accuracy"] = min(int(scores.get("response_accuracy", 5) or 5), 1)
-        scores["compliance"] = min(int(scores.get("compliance", 5) or 5), 1)
+        
+        scores["response_accuracy"] = min(int(scores.get("response_accuracy", 5) or 5), 3)
         if "response_accuracy" not in failed_parameters:
             failed_parameters.append("response_accuracy")
-        if "compliance" not in failed_parameters:
-            failed_parameters.append("compliance")
-        analysis["pass_fail"] = "FAIL"
+        
+        # Only mark FAIL if actually fatal
+        analysis["pass_fail"] = "FAIL" if has_fatal_flag else "PASS"
     elif risk_only:
         current_accuracy = int(scores.get("response_accuracy", 3) or 3)
         scores["response_accuracy"] = min(current_accuracy, 3)
@@ -1041,7 +1047,7 @@ CALL CLASSIFICATION:
 - sentiment: overall customer sentiment: "positive", "neutral", "frustrated", "angry", "distressed"
 
 FLAGGING RULES - BE STRICT AND PRECISE:
-- "compliance_breach" ONLY if: privacy laws violated, OTP shared improperly, promised guaranteed outcomes not authorized, shared restricted financial data, violated consumer protection act
+- "compliance_breach" ONLY if: privacy laws violated, promised guaranteed outcomes not authorized, shared restricted financial data, violated consumer protection act
 - "false_information" ONLY if: bot stated a product fact that directly contradicts the product spec (wrong premium amount, wrong age limit, wrong benefit amount, etc)
 - "regulatory_violation" ONLY if: violated RBI/IRDAI rules, illegal solicitation, improper disclosure
 - "behavior_issue" ONLY if: escalation needed but call ended without escalating, customer clearly in distress with no empathy shown, obvious system loop or malfunction
