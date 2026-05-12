@@ -90,6 +90,7 @@ def init_rag():
 @app.on_event("startup")
 async def startup():
     init_rag()
+    clear_expired_cache()  # Clean up any expired cache files
     if not DB_FILE.exists():
         DB_FILE.write_text(json.dumps({"calls": [], "jobs": []}, indent=2))
     if not PRODUCT_INDEX_FILE.exists():
@@ -115,7 +116,59 @@ def save_product_index(index_data: dict):
     PRODUCT_INDEX_FILE.write_text(json.dumps(index_data, indent=2, default=str))
 
 
-def _load_embedder():
+# ── Cache System (long-lived: expires in 2+ weeks) ──────────────────────────
+CACHE_DIR = PROC_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_EXPIRY_SECONDS = 14 * 24 * 60 * 60  # 2 weeks
+
+def _get_cache_file(key: str) -> Path:
+    """Get cache file path for a given key"""
+    safe_key = hashlib.md5(key.encode()).hexdigest()
+    return CACHE_DIR / f"{safe_key}.json"
+
+def get_cache(key: str) -> Any:
+    """Get value from cache if not expired"""
+    cache_file = _get_cache_file(key)
+    if not cache_file.exists():
+        return None
+    try:
+        data = json.loads(cache_file.read_text())
+        age_seconds = (datetime.now() - datetime.fromisoformat(data.get("cached_at", ""))).total_seconds()
+        if age_seconds < CACHE_EXPIRY_SECONDS:
+            return data.get("value")
+        else:
+            cache_file.unlink(missing_ok=True)
+    except Exception:
+        cache_file.unlink(missing_ok=True)
+    return None
+
+def set_cache(key: str, value: Any):
+    """Store value in cache with timestamp"""
+    cache_file = _get_cache_file(key)
+    try:
+        cache_file.write_text(json.dumps({
+            "cached_at": datetime.now().isoformat(),
+            "value": value
+        }, default=str))
+    except Exception as e:
+        log.warning(f"Cache write error: {e}")
+
+def clear_expired_cache():
+    """Remove expired cache files (called periodically)"""
+    try:
+        for cache_file in CACHE_DIR.glob("*.json"):
+            try:
+                data = json.loads(cache_file.read_text())
+                age_seconds = (datetime.now() - datetime.fromisoformat(data.get("cached_at", ""))).total_seconds()
+                if age_seconds >= CACHE_EXPIRY_SECONDS:
+                    cache_file.unlink(missing_ok=True)
+            except Exception:
+                cache_file.unlink(missing_ok=True)
+    except Exception as e:
+        log.warning(f"Cache cleanup error: {e}")
+
+
+
     if hasattr(_load_embedder, "_model"):
         return _load_embedder._model
     try:
@@ -383,7 +436,7 @@ def _build_product_checks(turns: List[Dict[str, Any]], analysis: Dict[str, Any])
 def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]) -> Dict[str, Any]:
     analysis = dict(analysis or {})
     scores = dict(analysis.get("scores") or {})
-    flags = list(dict.fromkeys(analysis.get("flags") or []))
+    flags = list(dict.fromkeys(analysis.get("flags") or []))  # Deduplicate incoming flags
     failed_parameters = list(dict.fromkeys(analysis.get("failed_parameters") or []))
 
     generated_checks = _build_product_checks(turns, analysis)
@@ -426,7 +479,9 @@ def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]
             f"{check.get('stmt', '')} -> {check.get('fact', '')}"
             for check in product_checks if check.get("verdict") == "fail"
         ) or "Incorrect product or policy information was provided."
-        flags.extend(["false_information", "compliance_breach", "regulatory_violation"])
+        # Only add flag if not already present (dedup check)
+        if "false_information" not in flags:
+            flags.append("false_information")
         scores["response_accuracy"] = min(int(scores.get("response_accuracy", 5) or 5), 1)
         scores["compliance"] = min(int(scores.get("compliance", 5) or 5), 1)
         if "response_accuracy" not in failed_parameters:
@@ -441,19 +496,17 @@ def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]
             analysis["product_issues"] = "Unconfirmed product information should be verified against the product specification before answering as fact."
         if analysis.get("product_accuracy_score") in {None, "", 0}:
             analysis["product_accuracy_score"] = 3
-        if product_query and "escalation_needed" not in flags:
-            flags.append("escalation_needed")
 
     if unable_response and product_query:
         if int(scores.get("system_behaviour", 3) or 3) > 2:
             scores["system_behaviour"] = 2
         if int(scores.get("compliance", 3) or 3) > 2:
             scores["compliance"] = 2
-        if "unresolved_critical" not in flags:
-            flags.append("unresolved_critical")
-        if "escalation_needed" not in flags:
-            flags.append("escalation_needed")
+        if "behavior_issue" not in flags:
+            flags.append("behavior_issue")
 
+    # Final dedup of all flags to prevent any duplicates
+    flags = list(dict.fromkeys(flags))
     analysis["scores"] = scores
     analysis["flags"] = flags
     analysis["failed_parameters"] = failed_parameters
@@ -691,6 +744,12 @@ def search_product_rag(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     if not query:
         return []
 
+    # Check cache first
+    cache_key = f"rag_search:{query}:{top_k}"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+
     index, meta_rows = _load_rag_index()
     if faiss is not None and index is not None and meta_rows:
         try:
@@ -704,16 +763,19 @@ def search_product_rag(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
                 row["score"] = float(score)
                 rows.append(row)
             if rows:
+                set_cache(cache_key, rows)
                 return rows
         except Exception as e:
             log.warning(f"FAISS retrieval failed, using keyword fallback: {e}")
 
     meta_rows = _load_rag_meta()
     if not meta_rows:
+        set_cache(cache_key, [])
         return []
     ranked = _keyword_rank(query, meta_rows, top_k=top_k)
     for i, row in enumerate(ranked):
         row["score"] = float(max(0.0, 1.0 - i * 0.1))
+    set_cache(cache_key, ranked)
     return ranked
 
 
@@ -723,12 +785,20 @@ def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any
     if not query:
         return {"product": "None", "context": "", "chunks": []}
 
+    # Check cache first
+    cache_key = f"product_context:{hashlib.md5(query.encode()).hexdigest()}"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+
     rows = search_product_rag(query, top_k=max(top_k, 8))
     meta_rows = _load_rag_meta()
     catalog = _build_product_catalog(meta_rows) if meta_rows else []
 
     if not rows and not catalog:
-        return {"product": "None", "context": "", "chunks": []}
+        result = {"product": "None", "context": "", "chunks": []}
+        set_cache(cache_key, result)
+        return result
 
     transcript_tokens = set(_tokenize(query))
     product_scores = defaultdict(float)
@@ -756,7 +826,9 @@ def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any
                     product_matches[product].add(feature)
 
     if not product_scores:
-        return {"product": "None", "context": "", "chunks": []}
+        result = {"product": "None", "context": "", "chunks": []}
+        set_cache(cache_key, result)
+        return result
 
     best_product, best_score = max(product_scores.items(), key=lambda item: item[1])
     best_profile = next((p for p in catalog if p["product"] == best_product), {})
@@ -777,8 +849,9 @@ def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any
     confidence = round(float(best_score), 3)
     product_confidence = min(0.99, 0.4 + confidence / 4.0)
 
-    return {
-        "product": best_product if best_score > 0.15 else "None",
+    # Lower threshold from 0.15 to 0.08 for better product detection
+    result = {
+        "product": best_product if best_score > 0.08 else "None",
         "confidence": round(product_confidence, 3),
         "matched_terms": evidence_terms,
         "catalog": catalog[:6],
@@ -787,6 +860,8 @@ def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any
         "chunks": supporting_rows,
         "profile": best_profile,
     }
+    set_cache(cache_key, result)
+    return result
 
 
 def query_product_rag(product_name: str, question: str) -> str:
@@ -946,6 +1021,7 @@ EVALUATION PARAMETERS (score each 1-5):
 
 PRODUCT EVALUATION:
 - Identify the insurance product(s) mentioned or strongly implied by the call, even if the call never states the product name
+- Analyze the actual conversation for product feature keywords: premium payment terms, coverage/sum assured amounts, eligibility criteria (age, income, employment status), policy tenure/term length, maturity/death benefits, riders, surrender/loan options, grace periods
 - Use product details such as premium structure, term, eligibility, surrender/loan behavior, maturity/death benefit, grace period, riders, and payout style to infer the right product
 - Explain why the chosen product matches the call and which product details support the match
 - Check if product details (premium, coverage, terms, exclusions, eligibility) mentioned are accurate based on the knowledge base
@@ -961,17 +1037,27 @@ CALL CLASSIFICATION:
 - category: One of [Policy Inquiry, Claims Assistance, Premium Payment, Policy Renewal, New Policy, Grievance, Technical Issue, General Query, Escalation Request, Cancellation Request]
 - severity: "normal", "watch", "critical", "fatal"
 - fatal_reason: explain if fatal (empty string otherwise)
-- flags: array of applicable: ["inappropriate_language", "compliance_breach", "escalation_needed", "false_information", "data_privacy_risk", "agent_misconduct", "customer_distress", "loop_detected", "unresolved_critical", "regulatory_violation"]
+- flags: array of ONLY actual violations: ["compliance_breach", "false_information", "regulatory_violation"] for critical issues. DO NOT flag routine statements, customer observations, or normal bot responses. ONLY flag if the bot actually violated compliance rules, gave factually incorrect product info, or exhibited problematic behavior
 - sentiment: overall customer sentiment: "positive", "neutral", "frustrated", "angry", "distressed"
 
+FLAGGING RULES - BE STRICT AND PRECISE:
+- "compliance_breach" ONLY if: privacy laws violated, OTP shared improperly, promised guaranteed outcomes not authorized, shared restricted financial data, violated consumer protection act
+- "false_information" ONLY if: bot stated a product fact that directly contradicts the product spec (wrong premium amount, wrong age limit, wrong benefit amount, etc)
+- "regulatory_violation" ONLY if: violated RBI/IRDAI rules, illegal solicitation, improper disclosure
+- "behavior_issue" ONLY if: escalation needed but call ended without escalating, customer clearly in distress with no empathy shown, obvious system loop or malfunction
+- DO NOT flag for: customer saying "I already have a policy", "I see one product purchased", "I'm looking for", normal questions, normal observations
+- DO NOT flag for: vague responses unless they violate compliance or are about product facts
+- DO NOT flag for: missing information unless the bot explicitly said something false or violated a rule
+- Empty flags array is correct if none of the above violations occurred
+
 FATAL TRIGGERS (mark fatal + flag immediately):
-- Any regulatory/compliance violation
-- False or misleading product information given to customer
-- Customer personal/financial data mishandled
-- Agent (bot) promises outcomes not authorized
-- Customer clearly distressed with no empathy or escalation
-- Inappropriate or offensive language
-- Call ends without resolution on critical issue with no escalation
+- Any regulatory/compliance violation (flags: ["regulatory_violation", "compliance_breach"])
+- False or misleading product information given to customer (flags: ["false_information"])
+- Customer personal/financial data mishandled (flags: ["compliance_breach"])
+- Agent (bot) promises outcomes not authorized (flags: ["compliance_breach"])
+- Customer clearly distressed with no empathy or escalation (flags: ["behavior_issue"])
+- Inappropriate or offensive language (flags: ["behavior_issue"])
+- Call ends without resolution on critical issue with no escalation (flags: ["behavior_issue"])
 
 OUTPUT FORMAT — respond with ONLY this JSON structure:
 {
@@ -993,8 +1079,8 @@ OUTPUT FORMAT — respond with ONLY this JSON structure:
   "failed_parameters": [<list of parameter names that didn't meet minimum>],
   "category": "<category>",
   "severity": "<normal|watch|critical|fatal>",
-  "fatal_reason": "<string>",
-  "flags": [<array of flag strings>],
+  "fatal_reason": "<string or empty string>",
+  "flags": [<array of flag strings: only actual compliance_breach, false_information, regulatory_violation, or behavior_issue if they occurred; empty array if no violations>],
   "sentiment": "<positive|neutral|frustrated|angry|distressed>",
   "product_mentioned": "<product name or 'None'>",
     "product_confidence": <0-1 float>,
@@ -1026,6 +1112,13 @@ async def analyze_call_with_gpt4o(transcript_text: str, turns: List[Dict], produ
 
 {formatted}
 {product_section}
+
+PRODUCT DETECTION INSTRUCTIONS:
+If product specs are provided above, use them to identify which product is being discussed.
+Match the conversation against the product features, benefits, policy terms, and coverage details.
+Look for keywords like: premium payment mode, coverage amount, policy term, age eligibility, maturity/death benefits, riders, surrender options.
+If the RAG context suggests a product, use it unless the conversation clearly contradicts it.
+If no product specs match, return "None" and explain why the call doesn't clearly indicate a specific product.
 
 Evaluate all parameters and return ONLY the JSON response.
 
