@@ -1198,7 +1198,7 @@ def _mock_analysis(turns: List[Dict]) -> Dict:
         "weighted_score": round(weighted, 2),
         "pass_fail": "FAIL" if failed else "PASS",
         "failed_parameters": failed,
-        "category": random.choice(["Policy Inquiry","Claims Assistance","Premium Payment","General Query","New Policy"]),
+        "category": random.choice(["Premium Receipt", "Premium Payment Assistance", "Policy Status Inquiry", "Policy Document Request", "Surrender Request", "Loan Against Policy", "Nominee Update", "Address or Contact Update", "Maturity Claim", "Death Claim", "Revival of Lapsed Policy", "Free Look Cancellation", "Rider Inquiry", "Fund Switch or Redirection", "Partial Withdrawal", "Benefit Illustration Request", "Complaint or Grievance", "Escalation Request", "General Inquiry"]),
         "severity": severity,
         "fatal_reason": "Compliance score below threshold" if severity == "fatal" else "",
         "flags": ["compliance_breach"] if severity == "fatal" else [],
