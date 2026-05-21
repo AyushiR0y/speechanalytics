@@ -29,3 +29,5 @@ products/
 Product Circulars/
 *.xlsx
 *.xls
+*.docx
+*.pdf
