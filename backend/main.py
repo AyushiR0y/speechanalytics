@@ -272,19 +272,48 @@ def _refine_sentiment(turns: List[Dict], model_sentiment: str = "neutral") -> st
 
 def _annotate_transcript(turns: List[Dict], analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
     annotations = []
+    sentiment = (analysis.get("sentiment") or "neutral").lower()
+    flags = set(analysis.get("flags") or [])
+
     for idx, turn in enumerate(turns, start=1):
         speaker = turn.get("speaker", "unknown")
         text = (turn.get("text") or "").strip()
+        text_lower = text.lower()
         tags = []
 
-        if speaker in {"bot", "agent", "system"} and re.search(r"grace period|30 day", text, re.I):
-            tags.append("Grace Period Explained")
+        if speaker in {"bot", "agent", "system"}:
+            if re.search(r"grace period|30 day", text, re.I):
+                tags.append("Grace Period Explained")
+            if re.search(r"transfer|connect you to|handover|escalate", text, re.I):
+                tags.append("Escalation Action")
+            if re.search(r"thank you|thanks|happy to help|is there anything else", text, re.I):
+                tags.append("Closure Cue")
+            if re.search(r"premium|sum assured|maturity|policy term|coverage|death benefit|rider", text, re.I):
+                tags.append("Product Information")
+            if re.search(r"sorry|apologize|apologies|regret|understand your concern", text, re.I):
+                tags.append("Empathy Shown")
+            if re.search(r"as per|according to|our records show|our system|we can see", text, re.I):
+                tags.append("Data Referenced")
+            if re.search(r"unable to|cannot provide|can't provide|not able to", text, re.I):
+                tags.append("⚠ Unable to Respond")
+            if re.search(r"please note|important|kindly note|please be aware", text, re.I):
+                tags.append("Important Notice")
+            if re.search(r"surrender|loan against|partial withdrawal|discontinue", text, re.I):
+                tags.append("Policy Action")
+            if re.search(r"verified|confirmed|otp|authentication", text, re.I):
+                tags.append("Verification")
 
-        if speaker in {"bot", "agent", "system"} and re.search(r"transfer|connect you to|handover|escalate", text, re.I):
-            tags.append("Escalation Action")
-
-        if re.search(r"thank you|thanks|happy to help", text, re.I):
-            tags.append("Closure Cue")
+        if speaker in {"customer", "user"}:
+            if re.search(r"angry|frustrated|unacceptable|worst|ridiculous|complaint", text, re.I):
+                tags.append("😠 Customer Frustrated")
+            if re.search(r"urgent|emergency|panic|distress|scared", text, re.I):
+                tags.append("🆘 Urgent")
+            if re.search(r"thank|thanks|great|helpful|good|excellent", text, re.I):
+                tags.append("😊 Positive Feedback")
+            if re.search(r"why|how|what|when|where|can you|could you|please explain", text, re.I):
+                tags.append("❓ Question")
+            if re.search(r"claim|surrender|cancel|withdraw|close|terminate", text, re.I):
+                tags.append("Policy Request")
 
         annotations.append({
             "sl": turn.get("sl", idx),
