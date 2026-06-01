@@ -1448,6 +1448,20 @@ from fastapi import Request
 @app.post("/api/ingest-call")
 async def ingest_realtime_call(request: Request, background_tasks: BackgroundTasks):
     """Receive a real-time call payload in the voicebot API format."""
+    # Optional API key enforcement: set INGEST_API_KEY in environment to require a token
+    expected_key = _env("INGEST_API_KEY", "")
+    if expected_key:
+        # Accept either Authorization: Bearer <token> or X-API-Key: <token>
+        auth = request.headers.get("authorization", "") or request.headers.get("Authorization", "")
+        api_key_header = request.headers.get("x-api-key", "") or request.headers.get("X-API-Key", "")
+        provided = None
+        if auth and auth.lower().startswith("bearer "):
+            provided = auth.split(" ", 1)[1].strip()
+        elif api_key_header:
+            provided = api_key_header.strip()
+        if not provided or provided != expected_key:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     payload = await request.json()
 
     # Map conversation_log roles to your internal speaker format

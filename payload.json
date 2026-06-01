@@ -1,0 +1,16 @@
+{
+  "unique_call_id": "test-call-001",
+  "STAGE_CODE": "CALL_COMPLETED",
+  "INTENT": "payment_information",
+  "conversation_summary": "Customer asked about premium receipt delivery.",
+  "no_of_queries": 1,
+  "no_of_queries_resolved": 1,
+  "call_comp_flag": "yes",
+  "sentiment": "Neutral",
+  "customer_journey": ["PREMIUM_RECEIPT_REQUEST","CALL_COMPLETED"],
+  "conversation_log": [
+    {"role":"assistant","content":"Good evening! How can I help you?","timestamp":1778502421.65},
+    {"role":"user","content":"I paid my premium but did not get a receipt.","timestamp":1778502455.30}
+  ],
+  "audio_link": null
+}
