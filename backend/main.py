@@ -5,7 +5,7 @@ FastAPI Backend
 
 import os, json, uuid, re, asyncio, hashlib, shutil, io
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import logging
@@ -245,29 +245,32 @@ def _score_reason(analysis: Dict[str, Any]) -> str:
 
 
 def _refine_sentiment(turns: List[Dict], model_sentiment: str = "neutral") -> str:
-    customer_text = " ".join(t.get("text", "") for t in turns if t.get("speaker") in {"customer", "user"}).lower()
-    bot_text = " ".join(t.get("text", "") for t in turns if t.get("speaker") in {"bot", "agent", "system", "assistant"}).lower()
+    """Tie-breaker only: trust the model unless it returned an unrecognised value,
+    or it returned plain 'neutral' AND the customer text contains strong, unambiguous
+    emotional signals (full phrases, not isolated keywords like 'still' / 'issue')."""
+    allowed = {"positive", "neutral", "frustrated", "angry", "distressed"}
+    model_sentiment = (model_sentiment or "neutral").strip().lower()
 
-    distress_words = ["urgent", "panic", "scared", "emergency", "distress", "anxious"]
-    angry_words = ["angry", "worst", "terrible", "frustrated", "complaint", "unacceptable", "ridiculous"]
-    frustrated_words = ["not working", "again", "still", "issue", "problem", "unable", "stuck"]
-    positive_words = ["thanks", "thank you", "great", "helpful", "resolved", "good"]
-    empathy_words = ["sorry", "understand", "help", "glad", "assist", "certainly"]
+    # If model returned something non-neutral and valid, ALWAYS keep it.
+    if model_sentiment in allowed and model_sentiment != "neutral":
+        return model_sentiment
 
-    def has_any(text: str, words: List[str]) -> bool:
-        return any(word in text for word in words)
+    # Only override 'neutral' if there is strong evidence (multi-word phrases).
+    customer_text = " ".join(
+        t.get("text", "") for t in turns if (t.get("speaker") or "").lower() in {"customer", "user"}
+    ).lower()
 
-    if has_any(customer_text, distress_words):
+    # Strong, unambiguous distress (whole phrases)
+    if re.search(r"\b(this is urgent|emergency|i('?| a)m scared|i('?| a)m panicking|please help me)\b", customer_text):
         return "distressed"
-    if has_any(customer_text, angry_words):
+    # Explicit anger (whole phrases or strong single words)
+    if re.search(r"\b(this is unacceptable|absolutely ridiculous|i('?| a)m (very )?angry|worst service|terrible service|extremely frustrated)\b", customer_text):
         return "angry"
-    if has_any(customer_text, frustrated_words):
-        if not has_any(bot_text, empathy_words):
-            return "frustrated"
-        return model_sentiment if model_sentiment in {"positive", "neutral"} else "frustrated"
-    if has_any(customer_text, positive_words):
+    # Explicit positive sentiment (gratitude phrases)
+    if re.search(r"\b(thank you so much|that was very helpful|really appreciate|excellent service|perfectly resolved)\b", customer_text):
         return "positive"
-    return model_sentiment if model_sentiment in {"positive", "neutral", "frustrated", "angry", "distressed"} else "neutral"
+
+    return model_sentiment if model_sentiment in allowed else "neutral"
 
 
 def _annotate_transcript(turns: List[Dict], analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -370,15 +373,42 @@ def _bot_sentences(turns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _best_spec_sentence(statement: str, analysis: Dict[str, Any], keywords: List[str]) -> str:
-    candidates: List[tuple] = []
+    """Find the most supportive sentence for `statement` in product evidence.
+
+    When the analysis contains multiple products (primary + secondaries from
+    `infer_product_context`), restrict search to the rows whose `product`
+    matches the bot's currently identified product. This stops comparisons
+    against the wrong product spec from generating bogus 'risk' verdicts.
+    """
+    primary_product = (analysis.get("product_mentioned") or "").strip().lower()
+    secondary = analysis.get("secondary_products") or []
+    candidate_products = {primary_product}
+    for s in secondary:
+        p = (s.get("product") or "").strip().lower()
+        if p:
+            candidate_products.add(p)
+
     search_rows = list(analysis.get("product_evidence") or [])
     profile = analysis.get("product_profile") or {}
-    search_texts = [row.get("text", "") for row in search_rows if row.get("text")]
+
+    # Build the search text pool, biased toward the right product.
+    def _row_product(r: Dict[str, Any]) -> str:
+        return (r.get("product") or "").strip().lower()
+
+    if primary_product and primary_product != "none":
+        primary_texts = [r.get("text", "") for r in search_rows if _row_product(r) == primary_product and r.get("text")]
+        other_texts = [r.get("text", "") for r in search_rows if _row_product(r) != primary_product and r.get("text")]
+        # Search the right product first; fall back to others only if nothing scored
+        search_texts = primary_texts or other_texts
+    else:
+        search_texts = [r.get("text", "") for r in search_rows if r.get("text")]
+
     search_texts.extend(profile.get("evidence_snippets") or [])
     if profile.get("summary"):
         search_texts.append(profile.get("summary"))
 
     stmt_tokens = set(_tokenize(statement))
+    candidates: List[tuple] = []
     for text in search_texts:
         for sentence in _sentence_split(text):
             sentence_lower = sentence.lower()
@@ -395,35 +425,429 @@ def _best_spec_sentence(statement: str, analysis: Dict[str, Any], keywords: List
     return candidates[0][1]
 
 
+def _fact_contains_range(fact: str) -> bool:
+    """Heuristic: does the fact sentence describe a numeric range (so a single
+    value inside it is NOT a contradiction)? Avoids false-positive 'fail'
+    verdicts when the bot states a value that falls within a spec range."""
+    f = (fact or "").lower()
+    if re.search(r"\b(between|from)\s+[\d.]+\s*(to|-|and|–|—)\s*[\d.]+", f):
+        return True
+    if re.search(r"\b(up to|upto|min(imum)?|max(imum)?|at least|at most|starting (from|at))\b", f):
+        return True
+    if re.search(r"[\d.]+\s*(to|-|–|—)\s*[\d.]+", f):  # bare "1 to 50", "18-65"
+        return True
+    return False
+
+
+def _fact_is_meta_instruction(fact: str) -> bool:
+    """Detect product-doc sentences that are meta-instructions to the agent
+    (e.g. "verify from the system", "refer to the policy bond") rather than
+    statements of actual product values. These must NEVER be used to
+    contradict a bot statement — they are guidance, not facts."""
+    if not fact:
+        return False
+    f = fact.lower()
+    patterns = [
+        r"verif(y|ied) (from|with|against) (the )?system",
+        r"refer to (the )?(policy|product) (bond|document|brochure|circular)",
+        r"check (the )?(system|records|cms|crm)",
+        r"as per (the )?(records|system|customer|policyholder)",
+        r"to be confirmed",
+        r"please (verify|confirm|check)",
+        r"should be verified",
+        r"available in (the )?(system|customer master|policy schedule)",
+    ]
+    return any(re.search(p, f) for p in patterns)
+
+
+def _customer_disputed_bot(turns: List[Dict[str, Any]]) -> bool:
+    """Did the customer push back on something the bot said?
+    Used to gate false_information flagging: we only mark a bot statement as
+    false if the customer disputes it OR the spec clearly contradicts it.
+    A bot quoting a number is NOT inaccurate on its own."""
+    dispute_patterns = re.compile(
+        r"\b("
+        r"that('?s| is) (wrong|incorrect|not right|not correct)|"
+        r"you (are|'re) wrong|"
+        r"that('?s)? not (true|right|what i|correct)|"
+        r"no(,| ) (that|it)('?s| is)? (not|wrong)|"
+        r"incorrect|mistake|wrongly|misinform"
+        r")\b",
+        re.IGNORECASE,
+    )
+    for i, t in enumerate(turns or []):
+        speaker = (t.get("speaker") or "").lower()
+        if speaker not in {"customer", "user"}:
+            continue
+        text = (t.get("text") or "").strip()
+        if not text:
+            continue
+        if dispute_patterns.search(text):
+            # Make sure there was a bot turn just before — i.e. customer is
+            # disputing the bot, not making a standalone complaint.
+            for j in range(i - 1, max(-1, i - 3), -1):
+                prev_speaker = (turns[j].get("speaker") or "").lower()
+                if prev_speaker in {"bot", "agent", "system"}:
+                    return True
+    return False
+
+
+# ── Customer-specific vs product-spec discriminator ─────────────────────────
+# When the bot reads back data fetched from the CRM / policy administration
+# system (the customer's own policy name, sum assured, maturity date, premium
+# amount, nominee, etc.) it is NOT making a product claim — it is quoting
+# that customer's record. Comparing such statements against the product spec
+# is meaningless and generates false-positive 'inaccurate' verdicts. These
+# helpers identify those statements so the QA rule layer can skip them.
+
+_POSSESSIVE_CRM_ATTRS = (
+    r"policy(?:\s+name|\s+number|\s+term|\s+holder)?|"
+    r"sum\s+assured|premium(?:\s+amount)?|nominee|"
+    r"maturity(?:\s+date|\s+amount|\s+value|\s+benefit)?|"
+    r"surrender(?:\s+date|\s+value|\s+amount)?|"
+    r"fund\s+value|account(?:\s+number)?|customer(?:\s+id)?|client(?:\s+id)?|"
+    r"date\s+of\s+(?:birth|maturity|commencement|inception|issue)|"
+    r"address|phone|mobile|email|contact|registered"
+)
+
+_POSSESSIVE_PATTERN = re.compile(
+    rf"\b(?:your|the\s+customer'?s|this\s+customer'?s|policy\s*holder'?s|their|his|her)\s+"
+    rf"(?:{_POSSESSIVE_CRM_ATTRS})\b",
+    re.IGNORECASE,
+)
+
+_CRM_INTRODUCERS = (
+    "your policy name is",
+    "your policy is",
+    "your policy will",
+    "your sum assured",
+    "your maturity",
+    "your premium",
+    "your nominee",
+    "your surrender",
+    "your fund value",
+    "your policy term",
+    "your date of",
+    "your address",
+    "your contact",
+    "your registered",
+    "as per our records, your",
+    "as per your policy",
+    "as per the records,",
+    "as per our records,",
+    "according to our records",
+    "according to the system",
+    "according to your policy",
+    "our records show that your",
+    "our records indicate",
+    "i can see that your",
+    "i can see your policy",
+    "i can see your",
+    "we can see that your",
+    "policy is currently",
+    "policy is in",
+    "policy is active",
+    "policy is surrendered",
+    "policy has been",
+)
+
+
+def _is_customer_specific_statement(stmt: str) -> bool:
+    """Detect if a bot statement is reading back CUSTOMER-SPECIFIC data from CRM.
+
+    Such statements (e.g. "your policy name is Bajaj Life Goal Assure",
+    "the sum assured is rupees seven lakh", "your maturity date is 22nd July
+    2029") MUST NOT be compared against product specs because the spec only
+    describes the product's structure / ranges, while the bot is quoting the
+    customer's individual record.
+
+    Returns True when the statement is clearly a CRM read-back.
+    """
+    if not stmt:
+        return False
+    s = stmt.lower().strip()
+
+    # 1) Possessive customer reference + policy attribute → CRM read-back
+    if _POSSESSIVE_PATTERN.search(s):
+        return True
+
+    # 2) Customer-data introducer phrases
+    if any(intro in s for intro in _CRM_INTRODUCERS):
+        return True
+
+    # 3) Specific date attached to a policy/maturity/surrender context →
+    #    almost certainly a per-customer date, not a product fact.
+    has_specific_date = bool(
+        re.search(
+            r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?"
+            r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+            r"[a-z]*[, ]+(?:twenty\s+)?\d{2,4}",
+            s,
+        )
+        or re.search(r"\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b", s)
+    )
+    if has_specific_date and re.search(
+        r"\b(your|policy|maturity|surrender|commenc(?:e|ed|ement)|"
+        r"inception|effective|issue|premium\s+due|next\s+premium|paid)\b",
+        s,
+    ):
+        return True
+
+    # 4) Currency amount + possessive/policy framing → customer-specific
+    #    e.g. "the sum assured is rupees seven lakh twenty thousand"
+    has_currency_amount = bool(
+        re.search(
+            r"\b(?:rupees|rs\.?|inr|₹)\s*[\w\s,]{0,40}?"
+            r"(?:lakh|crore|thousand|hundred|\d{3,})",
+            s,
+        )
+    )
+    if has_currency_amount and re.search(
+        r"\b(?:your|sum\s+assured|premium|maturity|fund\s+value|surrender)\b", s
+    ):
+        return True
+
+    return False
+
+
+# ── System-failure detector ─────────────────────────────────────────────────
+# Broader than the original "unable to provide information" check — catches
+# any phrasing where the bot says it could not fetch / retrieve / access
+# customer or policy data. These responses are HARD system failures and must
+# be flagged as fatal (not "conditionally OK") because the customer left the
+# call without the data they asked for.
+
+_SYSTEM_FAILURE_PATTERNS = (
+    # "unable to / cannot / couldn't <verb>" verbs that imply data retrieval
+    re.compile(
+        r"\b(?:unable\s+to|cannot|can'?t|could\s*not|couldn'?t|failed\s+to|"
+        r"not\s+able\s+to|having\s+trouble\s+(?:to\s+)?)\s+"
+        r"(?:provide|fetch|retriev\w*|access|find|locate|get|pull|obtain|"
+        r"share|give|display|show|determine|confirm|verify|process|"
+        r"check|look\s*up|generate)\b",
+        re.IGNORECASE,
+    ),
+    # "I'm unable / not able / having difficulty" without explicit verb
+    re.compile(
+        r"\b(?:i'?m|i\s+am|we'?re|we\s+are|the\s+system\s+is)\s+"
+        r"(?:unable|not\s+able|having\s+(?:difficulty|trouble|issues?))\b",
+        re.IGNORECASE,
+    ),
+    # "Unfortunately, I couldn't / I can't / I am unable / we are unable"
+    re.compile(
+        r"\bunfortunately[,\s]+(?:i\s+(?:couldn'?t|could\s+not|can(?:not|'t)|"
+        r"am\s+unable|was\s+unable)|we\s+(?:are\s+)?(?:unable|cannot|can'?t))\b",
+        re.IGNORECASE,
+    ),
+    # System / technical issues
+    re.compile(
+        r"\b(?:facing\s+(?:an?\s+)?(?:issue|problem|error|outage)|"
+        r"system\s+(?:error|issue|unavailable|down|outage|glitch)|"
+        r"technical\s+(?:issue|error|difficulty|problem|glitch)|"
+        r"experiencing\s+(?:an?\s+)?(?:issue|problem|error|delay))\b",
+        re.IGNORECASE,
+    ),
+    # "right now" / "at this moment" / "currently" combined with inability
+    re.compile(
+        r"\b(?:right\s+now|at\s+(?:this|the)\s+moment|at\s+this\s+time|currently)\b"
+        r"[^.?!]{0,80}?\b(?:unavailable|not\s+available|unable|cannot|"
+        r"can'?t|couldn'?t|could\s*not|won'?t\s+be\s+able)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:unable|cannot|can'?t|couldn'?t|could\s*not)\b"
+        r"[^.?!]{0,80}?\b(?:right\s+now|at\s+(?:this|the)\s+moment|"
+        r"at\s+this\s+time|currently|temporarily)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _is_system_failure_response(text: str) -> bool:
+    """Detect any bot response indicating it failed to fetch / retrieve /
+    access requested data — broader than the legacy 'unable to provide'
+    phrase set. Returns True when the bot has effectively told the customer
+    the data they asked for is currently unavailable."""
+    if not text:
+        return False
+    return any(pat.search(text) for pat in _SYSTEM_FAILURE_PATTERNS)
+
+
+# ── Transcript-level product-name extractor ─────────────────────────────────
+# Not all products mentioned in a call exist in the RAG index (e.g. a
+# customer references "Bajaj Life Shield Insurance Plan" but only Goal
+# Suraksha specs are uploaded). The RAG-based detector therefore misses
+# those names. This regex extractor surfaces them straight from the
+# transcript so the UI / multi-product list always reflects what was said.
+
+_PRODUCT_NAME_PATTERNS = (
+    # "Bajaj [Allianz] [Life] <Capitalised words> <Suffix>"
+    re.compile(
+        r"\bBajaj(?:\s+Allianz)?(?:\s+Life)?(?:\s+Insurance)?"
+        r"(?:\s+[A-Z][A-Za-z&]+){1,5}"
+        r"(?:\s+(?:Plan|Policy|Insurance|Suraksha|Assure|Shield|Goal|Wealth|"
+        r"Smart|Term|Protector|Saver|Income|Sampoorn|Sampada|Lifestyle|"
+        r"Magnum|Future|Care|Eternal|Premier|Elite|Lakshya|Sanchay|Anand|"
+        r"Money|ULIP|Endowment))?\b"
+    ),
+    # Stand-alone Bajaj product families ending with Plan/Policy/Insurance
+    re.compile(
+        r"\b(?:Goal|Smart|Lifestyle|Magnum|Future|Sampoorn|Sampada|Lakshya|"
+        r"Sanchay|Anand|Eternal|Premier|Shield|Wealth)\s+"
+        r"(?:[A-Z][a-z]+\s+){0,3}"
+        r"(?:Plan|Policy|Insurance|Suraksha|Assure|Shield)\b"
+    ),
+)
+
+
+def _extract_product_mentions_from_text(text: str) -> List[str]:
+    """Find Bajaj Life Insurance product names embedded in the transcript,
+    even when they are NOT present in the RAG index. Returns a deduped,
+    title-cased list in first-appearance order."""
+    if not text:
+        return []
+
+    matches: List[str] = []
+    seen: set = set()
+    for pattern in _PRODUCT_NAME_PATTERNS:
+        for m in pattern.finditer(text):
+            raw = re.sub(r"\s+", " ", m.group(0).strip())
+            # Drop trailing punctuation that crept in
+            raw = re.sub(r"[\.,;:!\?]+$", "", raw).strip()
+            if len(raw) < 6:
+                continue
+            # Title-case while preserving short tokens / acronyms
+            words = []
+            for w in raw.split():
+                if w.lower() in {"of", "and", "the", "for", "with"}:
+                    words.append(w.lower())
+                elif w.isupper() and len(w) <= 4:
+                    words.append(w)
+                else:
+                    words.append(w[:1].upper() + w[1:].lower() if w else w)
+            cleaned = " ".join(words)
+            # Normalise "Bajaj Allianz Life" → "Bajaj Life" to match _safe_filename_label
+            cleaned = re.sub(r"(?i)\bbajaj\s+allianz\s+life\b", "Bajaj Life", cleaned)
+            key = cleaned.lower()
+            if key not in seen and cleaned.lower() != "bajaj life":
+                seen.add(key)
+                matches.append(cleaned)
+    return matches
+
+
+# ── Date-range filter helper (used by /api/calls, /api/fatal-calls, etc.) ──
+def _filter_calls_by_range(
+    calls: List[Dict[str, Any]], range_key: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Filter call records by a friendly time range token.
+
+    Accepted values (case-insensitive, several aliases per range):
+      * 'all', 'forever', None, ''   → no filtering
+      * 'week', '7d', 'last_week'    → last 7 days
+      * 'month', '30d', 'last_month' → last 30 days
+      * 'day', 'today', '24h'        → last 24 hours
+    """
+    if not range_key:
+        return calls
+    key = range_key.strip().lower()
+    if key in {"", "all", "forever", "any"}:
+        return calls
+    now = datetime.now()
+    if key in {"day", "today", "24h", "1d"}:
+        cutoff = now - timedelta(days=1)
+    elif key in {"week", "7d", "7days", "last_week", "lastweek"}:
+        cutoff = now - timedelta(days=7)
+    elif key in {"month", "30d", "30days", "last_month", "lastmonth"}:
+        cutoff = now - timedelta(days=30)
+    else:
+        return calls
+    cutoff_iso = cutoff.isoformat()
+    out: List[Dict[str, Any]] = []
+    for c in calls:
+        ts = c.get("processed_at") or ""
+        if ts >= cutoff_iso:
+            out.append(c)
+    return out
+
+
 def _classify_product_check(statement: str, fact: str, keywords: List[str]) -> tuple:
-    stmt_lower = statement.lower()
-    fact_lower = fact.lower()
+    """Conservative rule-based verdict — only fire on hard, objective contradictions.
+
+    Design:
+      * Trust GPT-4o for semantic verdicts (it already produced its own product_checks).
+      * Rule layer is ONLY a safety net for: (a) evasive bot responses on product
+        questions, (b) clear numeric contradictions where the fact states a single
+        specific value (not a range) that disagrees with the bot.
+      * If fact contains a range (e.g. "1 to 50 lakhs"), single values are NOT
+        flagged as contradictions — they may well be inside the range.
+      * If the fact is a meta-instruction ("verify from system") it is NOT a
+        product value — never use it to contradict the bot.
+      * Default is 'pass' — never invent risk from token overlap.
+    """
+    stmt_lower = (statement or "").lower()
+    fact_lower = (fact or "").lower()
+
+    # NEW: customer-specific CRM read-backs are NEVER product-spec contradictions.
+    # The spec describes the product's structure; the bot is quoting THIS
+    # customer's individual data (their policy name, sum assured, maturity
+    # date, etc.). Pass these unconditionally.
+    if _is_customer_specific_statement(statement):
+        return "pass", "None"
+
+    if _is_system_failure_response(statement):
+        return "fail", "🚨 HIGH — bot reported a system failure when asked for customer/product data"
+
+    # NEW: meta-instructions in the spec are not facts. Skip.
+    if _fact_is_meta_instruction(fact):
+        return "pass", "None"
+
     stmt_nums = _extract_number_tokens(statement)
     fact_nums = _extract_number_tokens(fact)
+    if not stmt_nums or not fact_nums:
+        return "pass", "None"
 
-    if any(phrase in stmt_lower for phrase in ["unable to provide information", "cannot provide information", "can't provide information", "not able to provide information"]):
-        return "risk", "⚠️ Medium — evasive response on a product or policy question"
+    # Same numbers present → consistent.
+    if set(stmt_nums).intersection(fact_nums):
+        return "pass", "None"
 
-    if stmt_nums:
-        if fact_nums and not set(stmt_nums).intersection(fact_nums):
-            return "fail", "🚨 HIGH — numeric detail conflicts with the product specification"
-        if not fact_nums:
-            return "risk", "⚠️ Medium — numeric detail is not explicit in the supporting product sentence"
+    # Both sides must reference the same topic keyword to be comparable.
+    stmt_has_topic = any(kw in stmt_lower for kw in keywords)
+    fact_has_topic = any(kw in fact_lower for kw in keywords)
+    if not (stmt_has_topic and fact_has_topic):
+        return "pass", "None"
 
-    if any(word in stmt_lower for word in ["guaranteed", "only", "always", "never", "free", "must"]) and not any(keyword in fact_lower for keyword in keywords):
-        return "risk", "⚠️ Medium — categorical claim needs direct product-spec support"
+    # If the fact describes a range / min / max, a single statement value is
+    # probably IN-range — do not call this a fail. Surface as a soft risk so
+    # a human can confirm.
+    if _fact_contains_range(fact):
+        return "risk", "⚠️ Medium — bot stated a specific value where spec describes a range; please verify"
 
-    overlap = len(set(_tokenize(statement)).intersection(_tokenize(fact)))
-    if overlap < 3:
-        return "risk", "⚠️ Medium — supporting product sentence is indirect"
-
-    return "pass", "None"
+    # Both have specific single values, same topic, and they disagree → fail.
+    return "fail", "🚨 HIGH — numeric detail conflicts with the product specification"
 
 
 def _build_product_checks(turns: List[Dict[str, Any]], analysis: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Generate rule-based product checks ONLY for topics the model did not already
+    cover. The model's product_checks are the primary source; this fills gaps for
+    the unable_response + numeric-contradiction safety net.
+    """
     product_name = str(analysis.get("product_mentioned") or "None").strip()
     if not product_name or product_name == "None":
         return []
+
+    # Skip topics the model has already produced a check for
+    existing_topics = set()
+    for chk in analysis.get("product_checks") or []:
+        stmt_l = (chk.get("stmt") or "").lower()
+        for topic_name, kws in [
+            ("policy_term_eligibility", ["policy term", "entry age", "maturity age", "eligibility"]),
+            ("premium_payment", ["premium", "monthly", "quarterly", "half-yearly", "yearly"]),
+            ("benefits", ["maturity benefit", "death benefit", "guaranteed addition", "payout"]),
+            ("surrender_loan", ["surrender", "loan", "paid-up", "grace period", "revival"]),
+        ]:
+            if any(kw in stmt_l for kw in kws):
+                existing_topics.add(topic_name)
 
     bot_sentences = _bot_sentences(turns)
     topic_map = [
@@ -435,16 +859,33 @@ def _build_product_checks(turns: List[Dict[str, Any]], analysis: Dict[str, Any])
 
     checks: List[Dict[str, str]] = []
     for topic_name, keywords in topic_map:
-        statement_item = next((item for item in bot_sentences if any(keyword in item["text"].lower() for keyword in keywords)), None)
+        if topic_name in existing_topics:
+            continue  # model already covered it
+        statement_item = next(
+            (item for item in bot_sentences if any(keyword in item["text"].lower() for keyword in keywords)),
+            None,
+        )
         if not statement_item:
             continue
 
         statement = statement_item["text"].strip()
+
+        # Skip customer-specific (CRM read-back) statements outright — they
+        # describe the customer's individual record, not the product structure,
+        # and must not be compared against the spec.
+        if _is_customer_specific_statement(statement):
+            continue
+
         fact = _best_spec_sentence(statement, analysis, keywords)
         if not fact:
             continue
 
         verdict, risk = _classify_product_check(statement, fact, keywords)
+        # Only emit non-pass verdicts from the rule layer to avoid spamming the UI
+        # with low-value "pass" rows the model didn't bother generating.
+        if verdict == "pass":
+            continue
+
         checks.append({
             "call": str(analysis.get("call_id", "")),
             "stmt": statement,
@@ -453,106 +894,261 @@ def _build_product_checks(turns: List[Dict[str, Any]], analysis: Dict[str, Any])
             "vtext": "✓ ACCURATE" if verdict == "pass" else ("⚠️ CONDITIONALLY OK" if verdict == "risk" else "✗ INACCURATE"),
             "risk": risk,
             "topic": topic_name,
+            "source": "rule",
         })
 
-        if len(checks) >= 4:
+        if len(checks) >= 2:
             break
 
     return checks
 
 
 def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Safety-net rule layer.
+
+    Design principles (do NOT re-derive verdicts via brittle keyword matching):
+      1. TRUST the model's product_checks verdicts.
+      2. Only generate rule-based checks for topics the model missed.
+      3. To promote to FATAL we require BOTH:
+           a. model produced (or rule produced) a 'fail' verdict, AND
+           b. model returned a fatal-class flag (false_information / behavior_issue), AND
+           c. EITHER two independent fail verdicts OR a 'fail' check whose 'risk'
+              text contains a specific contradiction reason (numeric / spec / IRDAI / RBI).
+         Otherwise the call is marked 'watch' — surfaced for human review, NOT auto-fatal.
+      4. The unable_response + product_query → behavior_issue rule is preserved
+         (it is unambiguous and the model often misses it).
+      5. Flag list is deduped.
+    """
     analysis = dict(analysis or {})
     scores = dict(analysis.get("scores") or {})
-    flags = list(dict.fromkeys(analysis.get("flags") or []))  # Deduplicate incoming flags
+    flags = list(dict.fromkeys(analysis.get("flags") or []))
     failed_parameters = list(dict.fromkeys(analysis.get("failed_parameters") or []))
 
-    generated_checks = _build_product_checks(turns, analysis)
+    # ------------------------------------------------------------------
+    # Merge model checks with rule-generated checks (rule fills topic gaps only)
+    # ------------------------------------------------------------------
     existing_checks = list(analysis.get("product_checks") or [])
-    merged_checks = []
+    for c in existing_checks:
+        c.setdefault("source", "model")
+    generated_checks = _build_product_checks(turns, analysis)
+
+    merged_checks: List[Dict[str, Any]] = []
     seen_pairs = set()
     for check in existing_checks + generated_checks:
         key = (
-            (check.get("stmt") or "").strip().lower(),
-            (check.get("fact") or "").strip().lower(),
+            (check.get("stmt") or "").strip().lower()[:160],
+            (check.get("fact") or "").strip().lower()[:160],
         )
         if key in seen_pairs:
             continue
         seen_pairs.add(key)
         merged_checks.append(check)
     analysis["product_checks"] = merged_checks[:6]
+    product_checks = analysis["product_checks"]
 
-    product_checks = analysis.get("product_checks") or []
-    hard_fail = any(check.get("verdict") == "fail" for check in product_checks)
-    risk_only = any(check.get("verdict") == "risk" for check in product_checks)
+    # ------------------------------------------------------------------
+    # Sanitise model verdicts:
+    #   * If the bot statement is a customer-specific CRM read-back ("your
+    #     policy name is X", "your maturity date is Y", "the sum assured is
+    #     rupees Z"), downgrade ANY fail/risk → pass. The spec never describes
+    #     a particular customer's policy, so these are not contradictions.
+    #   * If the supporting "fact" is a meta-instruction ("verify from system",
+    #     "refer to policy bond"), downgrade fail/risk → pass. The bot is not
+    #     wrong just because the spec says "consult the system".
+    #   * If verdict is fail/risk but no customer dispute happened AND no
+    #     numeric contradiction is in the risk text, downgrade fail → risk
+    #     (we surface for human review, not auto-fatal).
+    # ------------------------------------------------------------------
+    customer_disputed = _customer_disputed_bot(turns)
+    for c in product_checks:
+        verdict = (c.get("verdict") or "").lower()
+        stmt = c.get("stmt") or ""
+        fact = c.get("fact") or ""
+        risk_text = (c.get("risk") or "").lower()
+
+        # 1) Customer-specific CRM data → never a product contradiction
+        if verdict in {"fail", "risk"} and _is_customer_specific_statement(stmt):
+            c["verdict"] = "pass"
+            c["vtext"] = "✓ ACCURATE"
+            c["risk"] = "None"
+            c["note"] = (
+                "Statement is customer-specific data (e.g. their policy name, "
+                "sum assured, maturity date) read back from CRM — not a "
+                "product-spec claim, so not compared against the spec."
+            )
+            continue
+
+        # 2) Meta-instructions in the spec are not contradicting facts
+        if verdict in {"fail", "risk"} and _fact_is_meta_instruction(fact):
+            c["verdict"] = "pass"
+            c["vtext"] = "✓ ACCURATE"
+            c["risk"] = "None"
+            c["note"] = "Spec sentence was a meta-instruction (e.g. 'verify from system'), not a contradicting fact."
+        elif verdict == "fail":
+            has_numeric_reason = bool(re.search(r"\b(numeric|differ|conflict|contradict|wrong number|wrong age|wrong premium|wrong amount)\b", risk_text))
+            has_spec_reason = bool(re.search(r"\b(spec|irda|rbi|regulator|product circular|policy bond)\b", risk_text))
+            if not customer_disputed and not has_numeric_reason and not has_spec_reason:
+                c["verdict"] = "risk"
+                c["vtext"] = "⚠️ CONDITIONALLY OK"
+                c["note"] = "Downgraded: no customer dispute and no concrete spec contradiction. Manual review recommended."
+
+    # ------------------------------------------------------------------
+    # Fail / risk signal extraction
+    # ------------------------------------------------------------------
+    fail_checks = [c for c in product_checks if (c.get("verdict") or "").lower() == "fail"]
+    risk_checks = [c for c in product_checks if (c.get("verdict") or "").lower() == "risk"]
+    hard_fail = len(fail_checks) > 0
+    risk_only = (not hard_fail) and len(risk_checks) > 0
+
+    # Confidence test: is a fail check substantiated with a concrete reason?
+    def _is_substantiated(chk: Dict[str, Any]) -> bool:
+        risk_text = (chk.get("risk") or "").lower()
+        return bool(re.search(
+            r"(numeric|conflicts?|contradict|wrong|incorrect|inaccurate|irda|rbi|specification|spec |misstate|misleading)",
+            risk_text,
+        ))
+
+    substantiated_fails = [c for c in fail_checks if _is_substantiated(c)]
+    model_fatal_flag = ("false_information" in flags) or ("behavior_issue" in flags)
+    # ------------------------------------------------------------------
+    # System-failure rule — broadened to cover "couldn't fetch / unable to
+    # retrieve / failed to access" etc. ANY such bot response on a
+    # product / customer-data query is a HARD system failure and the call
+    # is escalated to FATAL (not just watch / behavior_issue).
+    # ------------------------------------------------------------------
+    product_keywords = ("policy", "product", "premium", "sum assured", "maturity",
+                        "surrender", "loan", "coverage", "term", "nominee",
+                        "fund value", "claim", "renewal")
     product_query = any(
-        any(keyword in (turn.get("text", "").lower()) for keyword in ["policy", "product", "premium", "sum assured", "maturity", "surrender", "loan", "coverage", "term"])
+        any(k in (turn.get("text", "") or "").lower() for k in product_keywords)
         for turn in turns
     )
-    unable_response = any(
-        phrase in (turn.get("text", "").lower())
-        for turn in turns
-        if (turn.get("speaker") or "").lower() in {"bot", "agent", "system"}
-        for phrase in ["unable to provide information", "cannot provide information", "can't provide information", "not able to provide information"]
+    failed_bot_turn = next(
+        (
+            turn for turn in turns
+            if (turn.get("speaker") or "").lower() in {"bot", "agent", "system"}
+            and _is_system_failure_response(turn.get("text", "") or "")
+        ),
+        None,
     )
+    unable_response = failed_bot_turn is not None
 
+    # ------------------------------------------------------------------
+    # Severity decision
+    # ------------------------------------------------------------------
     if hard_fail:
-        # Product checks failed (missing or incorrect info)
-        # Only mark as FATAL if false_information or behavior_issue flags exist
-        has_fatal_flag = "false_information" in flags or "behavior_issue" in flags
-        if has_fatal_flag:
+        # Confidence gating: promote to fatal only with strong evidence.
+        #   - At least one substantiated fail (spec / numeric / regulator), OR
+        #   - Two independent fails, OR
+        #   - Customer explicitly disputed something the bot said.
+        strong_evidence = (
+            model_fatal_flag and (
+                len(substantiated_fails) >= 1
+                or len(fail_checks) >= 2
+                or customer_disputed
+            )
+        )
+
+        if strong_evidence:
             analysis["severity"] = "fatal"
-            analysis["fatal_reason"] = "Call contains false product information or significant behavior issues."
+            analysis["fatal_reason"] = (
+                analysis.get("fatal_reason")
+                or ("Customer explicitly disputed bot information." if customer_disputed else None)
+                or "; ".join((c.get("risk") or "").strip() for c in substantiated_fails if c.get("risk"))
+                or "Substantiated product / compliance failure."
+            )
             analysis["product_accuracy_score"] = 0
+            analysis["pass_fail"] = "FAIL"
+            if "false_information" not in flags and (
+                customer_disputed or any(
+                    "numeric" in (c.get("risk") or "").lower() or "spec" in (c.get("risk") or "").lower()
+                    for c in substantiated_fails
+                )
+            ):
+                flags.append("false_information")
         else:
-            # Missing/unconfirmed info is a watch item, not fatal
+            # Surface for human review, do NOT auto-fatal on weak signal.
             analysis["severity"] = "watch"
-            analysis["product_accuracy_score"] = 2
-        
-        analysis["product_issues"] = "; ".join(
-            f"{check.get('stmt', '')} -> {check.get('fact', '')}"
-            for check in product_checks if check.get("verdict") == "fail"
-        ) or "Product information contains inaccuracies or unconfirmed details."
-        
-        # Only add flag if not already present (dedup check)
-        if "false_information" not in flags:
-            flags.append("false_information")
-        
+            analysis["product_accuracy_score"] = analysis.get("product_accuracy_score") or 2
+            analysis["pass_fail"] = analysis.get("pass_fail") or "PASS"
+            # Remove unsubstantiated false_information flag if the model raised
+            # it without evidence (customer didn't dispute and no spec contradiction).
+            if "false_information" in flags and not customer_disputed and not substantiated_fails:
+                flags = [f for f in flags if f != "false_information"]
+
+        analysis["product_issues"] = analysis.get("product_issues") or (
+            "; ".join(
+                f"{(c.get('stmt') or '')[:120]} → {(c.get('fact') or '')[:120]}"
+                for c in fail_checks
+            )
+            or "Product information needs human review."
+        )
+
         scores["response_accuracy"] = min(int(scores.get("response_accuracy", 5) or 5), 3)
         if "response_accuracy" not in failed_parameters:
             failed_parameters.append("response_accuracy")
-        
-        # Only mark FAIL if actually fatal
-        analysis["pass_fail"] = "FAIL" if has_fatal_flag else "PASS"
+
     elif risk_only:
-        current_accuracy = int(scores.get("response_accuracy", 3) or 3)
+        current_accuracy = int(scores.get("response_accuracy", 4) or 4)
         scores["response_accuracy"] = min(current_accuracy, 3)
         if not analysis.get("product_issues") or analysis.get("product_issues") in {"None", ""}:
-            analysis["product_issues"] = "Unconfirmed product information should be verified against the product specification before answering as fact."
+            analysis["product_issues"] = (
+                "Unconfirmed product information should be verified against the product specification."
+            )
         if analysis.get("product_accuracy_score") in {None, "", 0}:
             analysis["product_accuracy_score"] = 3
 
+    # System failure rule (independent of product checks).
+    # When the bot tells the customer it cannot fetch / retrieve / access the
+    # requested data, the customer left the call WITHOUT what they asked for.
+    # That is a hard system failure and must be FATAL, not a soft watch.
     if unable_response and product_query:
-        if int(scores.get("system_behaviour", 3) or 3) > 2:
-            scores["system_behaviour"] = 2
-        if int(scores.get("compliance", 3) or 3) > 2:
-            scores["compliance"] = 2
+        scores["system_behaviour"] = min(int(scores.get("system_behaviour", 3) or 3), 1)
+        scores["compliance"] = min(int(scores.get("compliance", 3) or 3), 2)
+        scores["resolution"] = min(int(scores.get("resolution", 3) or 3), 1)
         if "behavior_issue" not in flags:
             flags.append("behavior_issue")
+        if "system_failure" not in flags:
+            flags.append("system_failure")
 
-    # Final dedup of all flags to prevent any duplicates
+        # Promote severity to fatal (overrides hard_fail / risk_only branch above)
+        analysis["severity"] = "fatal"
+        analysis["pass_fail"] = "FAIL"
+        failure_quote = ""
+        if failed_bot_turn:
+            failure_quote = (failed_bot_turn.get("text") or "").strip()
+            if len(failure_quote) > 220:
+                failure_quote = failure_quote[:217].rstrip() + "…"
+        analysis["fatal_reason"] = (
+            f"System failure: bot was unable to fetch / retrieve the data the customer asked for"
+            + (f' — "{failure_quote}"' if failure_quote else ".")
+        )
+        existing_issues = (analysis.get("product_issues") or "").strip()
+        sf_issue = "System failure: bot could not fetch the requested policy data."
+        if not existing_issues or existing_issues.lower() in {"none", ""}:
+            analysis["product_issues"] = sf_issue
+        elif sf_issue.lower() not in existing_issues.lower():
+            analysis["product_issues"] = f"{existing_issues}; {sf_issue}"
+        for fp in ("system_behaviour", "resolution"):
+            if fp not in failed_parameters:
+                failed_parameters.append(fp)
+
+    # ------------------------------------------------------------------
+    # Finalise
+    # ------------------------------------------------------------------
     flags = list(dict.fromkeys(flags))
     analysis["scores"] = scores
     analysis["flags"] = flags
     analysis["failed_parameters"] = failed_parameters
     analysis["qa_findings"] = _build_qa_findings({**analysis, "transcript": turns})
     analysis["score_reason"] = _score_reason(analysis)
+
     if not analysis.get("product_accuracy_score") and product_checks:
-        analysis["product_accuracy_score"] = 5 if not risk_only and not hard_fail else 3
+        analysis["product_accuracy_score"] = 5 if (not risk_only and not hard_fail) else 3
     if not analysis.get("product_issues"):
         analysis["product_issues"] = "None"
     if analysis.get("severity") == "fatal" and not analysis.get("fatal_reason"):
-        analysis["fatal_reason"] = "Incorrect product or policy information was provided."
+        analysis["fatal_reason"] = "Substantiated product or policy failure."
     if analysis.get("severity") not in {"fatal", "critical", "watch", "normal"}:
         analysis["severity"] = "watch"
     if analysis.get("pass_fail") not in {"PASS", "FAIL"}:
@@ -578,6 +1174,53 @@ PRODUCT_FEATURE_KEYWORDS = {
 
 def _tokenize(text: str) -> List[str]:
     return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 2]
+
+
+def _collect_products_mentioned(
+    analysis: Dict[str, Any],
+    rag_hit: Dict[str, Any],
+    transcript_text: str = "",
+) -> List[str]:
+    """Merge every product the model/RAG/transcript-regex identified into an
+    ordered, deduped list.
+
+    Order priority:
+      1. analysis["product_mentioned"] (primary, from GPT)
+      2. analysis["products_mentioned"] (GPT-supplied list, if any)
+      3. rag_hit["product"] (RAG top guess)
+      4. each entry from rag_hit["secondary_products"] (in their order)
+      5. each entry from rag_hit["all_product_scores"] (final fallback)
+      6. NEW: any Bajaj product names extracted directly from the transcript
+              text — covers products not present in the RAG index.
+    """
+    seen: set = set()
+    out: List[str] = []
+
+    def _add(name: Any):
+        if not name:
+            return
+        s = _safe_filename_label(str(name)).strip()
+        if not s or s.lower() == "none":
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(s)
+
+    _add(analysis.get("product_mentioned"))
+    for p in (analysis.get("products_mentioned") or []):
+        _add(p)
+    _add((rag_hit or {}).get("product"))
+    for sec in ((rag_hit or {}).get("secondary_products") or []):
+        _add(sec.get("product"))
+    for name in ((rag_hit or {}).get("all_product_scores") or {}).keys():
+        _add(name)
+    # NEW: transcript-extracted product names (e.g. "Bajaj Life Shield
+    # Insurance Plan" when only Goal Suraksha specs are uploaded to RAG).
+    for name in _extract_product_mentions_from_text(transcript_text or ""):
+        _add(name)
+    return out
 
 
 def _sentence_snippets(text: str, limit: int = 4) -> List[str]:
@@ -646,17 +1289,117 @@ def _document_text(path: Path) -> str:
     return ""
 
 
-def _chunk_text(text: str, chunk_size: int = 280, overlap: int = 60) -> List[str]:
-    words = re.findall(r"\S+", text)
-    if not words:
+def _chunk_text(text: str, chunk_size: int = 400, overlap: int = 100,
+                sentence_mode: bool = True) -> List[str]:
+    """Sentence-aware chunking optimised for product specs.
+
+    When `sentence_mode` is True (default) we emit ONE chunk per meaningful
+    sentence (≥ 12 words). Adjacent short sentences are merged until the
+    combined chunk reaches a minimum length. This keeps numeric facts intact
+    (premium amounts, ages, %), which previously caused false 'numeric
+    conflict' fails when facts straddled chunk boundaries.
+
+    A single huge sentence (> chunk_size words) is split with word-level
+    overlap so it is not lost.
+
+    Args:
+        chunk_size: maximum word count per chunk.
+        overlap:    word count carried over between consecutive chunks.
+        sentence_mode: if False, falls back to the older grouped behaviour.
+    """
+    text = (text or "").strip()
+    if not text:
         return []
-    step = max(1, chunk_size - overlap)
-    chunks = []
-    for start in range(0, len(words), step):
-        chunk = " ".join(words[start:start + chunk_size]).strip()
-        if len(chunk) >= 80:
-            chunks.append(chunk)
-    return chunks
+
+    # Split on sentence boundaries while preserving punctuation.
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return []
+
+    MIN_WORDS = 12          # below this, sentence is "short" and gets merged
+    MIN_CHUNK_CHARS = 80    # discard tiny residuals
+    chunks: List[str] = []
+
+    if sentence_mode:
+        buffer: List[str] = []
+        buffer_len = 0
+        for sent in sentences:
+            sent_words = sent.split()
+            sent_len = len(sent_words)
+
+            # Huge sentence — split with word overlap
+            if sent_len > chunk_size:
+                if buffer:
+                    chunks.append(" ".join(buffer).strip())
+                    buffer, buffer_len = [], 0
+                step = max(1, chunk_size - overlap)
+                for start in range(0, sent_len, step):
+                    piece = " ".join(sent_words[start:start + chunk_size]).strip()
+                    if len(piece) >= MIN_CHUNK_CHARS:
+                        chunks.append(piece)
+                continue
+
+            # Substantial standalone sentence — flush buffer + emit as its own chunk
+            if sent_len >= MIN_WORDS and buffer_len == 0:
+                chunks.append(sent.strip())
+                continue
+
+            # Short sentence — accumulate
+            if buffer_len + sent_len <= chunk_size:
+                buffer.append(sent)
+                buffer_len += sent_len
+            else:
+                if buffer:
+                    chunks.append(" ".join(buffer).strip())
+                buffer = [sent]
+                buffer_len = sent_len
+
+            # If the accumulated buffer is now substantial, flush it.
+            if buffer_len >= MIN_WORDS:
+                chunks.append(" ".join(buffer).strip())
+                buffer, buffer_len = [], 0
+
+        if buffer:
+            tail = " ".join(buffer).strip()
+            if len(tail) >= MIN_CHUNK_CHARS or not chunks:
+                chunks.append(tail)
+        return [c for c in chunks if len(c) >= MIN_CHUNK_CHARS]
+
+    # Legacy grouped mode (fallback)
+    current: List[str] = []
+    current_len = 0
+    for sent in sentences:
+        sent_words = sent.split()
+        sent_len = len(sent_words)
+        if sent_len > chunk_size:
+            if current:
+                chunks.append(" ".join(current).strip())
+                current, current_len = [], 0
+            step = max(1, chunk_size - overlap)
+            for start in range(0, sent_len, step):
+                piece = " ".join(sent_words[start:start + chunk_size]).strip()
+                if len(piece) >= MIN_CHUNK_CHARS:
+                    chunks.append(piece)
+            continue
+        if current_len + sent_len <= chunk_size:
+            current.append(sent)
+            current_len += sent_len
+        else:
+            if current:
+                chunks.append(" ".join(current).strip())
+            if overlap > 0 and current:
+                tail_words = " ".join(current).split()[-overlap:]
+                current = [" ".join(tail_words), sent]
+                current_len = len(tail_words) + sent_len
+            else:
+                current = [sent]
+                current_len = sent_len
+    if current:
+        tail = " ".join(current).strip()
+        if len(tail) >= MIN_CHUNK_CHARS or not chunks:
+            chunks.append(tail)
+    return [c for c in chunks if len(c) >= MIN_CHUNK_CHARS]
 
 
 def _collect_product_files() -> List[Path]:
@@ -703,7 +1446,14 @@ def _load_rag_index():
 
 
 def rebuild_product_rag_index() -> dict:
-    """Build or rebuild the local product knowledge base."""
+    """Build or rebuild the local product knowledge base.
+
+    Optimisation: maintains a signature file at PROC_DIR / 'rag_signature.json'
+    listing {file_name: sha1}. If every PDF/doc in the products folder still
+    matches its previous sha1, we skip re-embedding entirely. Otherwise we
+    re-embed only the chunks of changed files (cached embeddings for unchanged
+    files are reused via PROC_DIR / 'embed_cache.npz').
+    """
     files = _collect_product_files()
     meta_rows: List[Dict[str, Any]] = []
 
@@ -712,11 +1462,64 @@ def rebuild_product_rag_index() -> dict:
             RAG_INDEX_FILE.unlink(missing_ok=True)
         RAG_META_FILE.write_text("[]")
         _save_rag_backend("empty")
+        # also clear cached signature so a future upload triggers a rebuild
+        sig_path = PROC_DIR / "rag_signature.json"
+        if sig_path.exists():
+            sig_path.unlink(missing_ok=True)
         return {"mode": "empty", "chunks": 0, "products": 0}
 
+    # ---- 1. compute current signature ----
+    sig_path = PROC_DIR / "rag_signature.json"
+    embed_cache_path = PROC_DIR / "embed_cache.npz"
+    current_sig: Dict[str, str] = {}
+    for path in files:
+        try:
+            current_sig[path.name] = hashlib.sha1(path.read_bytes()).hexdigest()
+        except Exception:
+            current_sig[path.name] = f"{path.name}:{path.stat().st_size}"
+
+    prev_sig: Dict[str, str] = {}
     try:
-        model = _load_embedder()
-        texts = []
+        prev_sig = json.loads(sig_path.read_text())
+    except Exception:
+        prev_sig = {}
+
+    everything_unchanged = (
+        prev_sig == current_sig
+        and RAG_INDEX_FILE.exists()
+        and RAG_META_FILE.exists()
+        and embed_cache_path.exists()
+    )
+    if everything_unchanged:
+        log.info("RAG index already up to date — skipping re-embed.")
+        meta = _load_rag_meta()
+        return {
+            "mode": (json.loads(RAG_BACKEND_FILE.read_text()).get("mode", "faiss")
+                     if RAG_BACKEND_FILE.exists() else "faiss"),
+            "chunks": len(meta),
+            "products": len(files),
+            "cache": "hit",
+        }
+
+    # ---- 2. load existing embedding cache (key: sha1(chunk text)) ----
+    embed_cache: Dict[str, np.ndarray] = {}
+    if embed_cache_path.exists():
+        try:
+            with np.load(str(embed_cache_path), allow_pickle=False) as npz:
+                # store as one matrix + key list, keyed by sha1 strings
+                cache_keys = npz["keys"].tolist() if "keys" in npz else []
+                cache_mat = npz["vecs"] if "vecs" in npz else np.zeros((0, 0))
+                for i, k in enumerate(cache_keys):
+                    embed_cache[k] = cache_mat[i]
+            log.info(f"Loaded {len(embed_cache)} cached embeddings.")
+        except Exception as e:
+            log.warning(f"Embed cache load failed (rebuilding): {e}")
+            embed_cache = {}
+
+    try:
+        model = _load_embedder()  # ensures model is loaded once
+        chunk_texts: List[str] = []
+        chunk_keys: List[str] = []
         for path in files:
             doc_text = _document_text(path)
             if not doc_text.strip():
@@ -724,7 +1527,8 @@ def rebuild_product_rag_index() -> dict:
             chunks = _chunk_text(doc_text)
             product_label = _safe_filename_label(path.name)
             for chunk_idx, chunk in enumerate(chunks):
-                texts.append(chunk)
+                chunk_texts.append(chunk)
+                chunk_keys.append(hashlib.sha1(chunk.encode("utf-8")).hexdigest())
                 meta_rows.append({
                     "source": path.name,
                     "path": str(path),
@@ -735,12 +1539,25 @@ def rebuild_product_rag_index() -> dict:
                     "page": None,
                 })
 
-        if not texts:
+        if not chunk_texts:
             RAG_META_FILE.write_text("[]")
             _save_rag_backend("empty")
+            sig_path.write_text(json.dumps(current_sig, indent=2))
             return {"mode": "empty", "chunks": 0, "products": len(files)}
 
-        vectors = _embed_texts(texts)
+        # ---- 3. only embed chunks we don't already have ----
+        missing_idx = [i for i, k in enumerate(chunk_keys) if k not in embed_cache]
+        if missing_idx:
+            log.info(f"Embedding {len(missing_idx)} new chunks (cached: {len(chunk_keys) - len(missing_idx)}).")
+            new_vecs = _embed_texts([chunk_texts[i] for i in missing_idx])
+            for vec, i in zip(new_vecs, missing_idx):
+                embed_cache[chunk_keys[i]] = vec.astype(np.float32)
+        else:
+            log.info("All chunks already cached — no embedding calls made.")
+
+        # Materialise the full vector matrix in the right order
+        vectors = np.vstack([embed_cache[k] for k in chunk_keys]).astype(np.float32)
+
         if faiss is not None:
             index = faiss.IndexFlatIP(vectors.shape[1])
             index.add(vectors)
@@ -751,7 +1568,23 @@ def rebuild_product_rag_index() -> dict:
             _save_rag_backend("keyword")
 
         RAG_META_FILE.write_text(json.dumps(meta_rows, indent=2, default=str))
-        return {"mode": "faiss" if faiss is not None else "keyword", "chunks": len(meta_rows), "products": len(files)}
+
+        # ---- 4. persist signature + cache ----
+        sig_path.write_text(json.dumps(current_sig, indent=2))
+        try:
+            keys_arr = np.array(list(embed_cache.keys()))
+            vecs_arr = np.vstack(list(embed_cache.values())).astype(np.float32)
+            np.savez_compressed(str(embed_cache_path), keys=keys_arr, vecs=vecs_arr)
+        except Exception as e:
+            log.warning(f"Embed cache write failed: {e}")
+
+        return {
+            "mode": "faiss" if faiss is not None else "keyword",
+            "chunks": len(meta_rows),
+            "products": len(files),
+            "cache": "partial" if missing_idx else "full",
+            "embedded_now": len(missing_idx),
+        }
     except Exception as e:
         log.warning(f"Product RAG rebuild failed: {e}")
         RAG_META_FILE.write_text("[]")
@@ -884,6 +1717,43 @@ def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any
     confidence = round(float(best_score), 3)
     product_confidence = min(0.99, 0.4 + confidence / 4.0)
 
+    # ------------------------------------------------------------------
+    # Multi-product detection: if more than one product scored close to the top,
+    # surface them all so downstream checks compare against the correct spec
+    # rather than only the single highest match.
+    # ------------------------------------------------------------------
+    secondary_products: List[Dict[str, Any]] = []
+    threshold_score = best_score * 0.55  # within 55% of the top score
+    transcript_lower = (query or "").lower()
+    for prod, score in product_scores.items():
+        if prod == best_product:
+            continue
+        # Surface a secondary product if EITHER it scores close to the top
+        # OR its label appears in the transcript verbatim (explicit mention).
+        explicit_mention = bool(prod) and prod.lower() in transcript_lower
+        if score >= threshold_score or explicit_mention:
+            sec_profile = next((p for p in catalog if p["product"] == prod), {})
+            sec_rows = sorted(
+                product_evidence.get(prod, []),
+                key=lambda r: r.get("score", 0.0),
+                reverse=True,
+            )[:max(2, top_k // 2)]
+            secondary_products.append({
+                "product": prod,
+                "score": round(float(score), 3),
+                "explicit_mention": explicit_mention,
+                "evidence": sec_rows,
+                "profile": sec_profile,
+            })
+            # Append a context section so the LLM sees both specs
+            for row in sec_rows:
+                context_lines.append(
+                    f"[SECONDARY | {row.get('product', 'Unknown')} | {row.get('source', 'spec')} | chunk {row.get('chunk_index', 0)}] {row.get('text', '')}"
+                )
+
+    secondary_products.sort(key=lambda x: (-int(x["explicit_mention"]), -x["score"]))
+    secondary_products = secondary_products[:3]
+
     # Lower threshold from 0.15 to 0.08 for better product detection
     result = {
         "product": best_product if best_score > 0.08 else "None",
@@ -894,6 +1764,8 @@ def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any
         "context": "\n\n".join(context_lines),
         "chunks": supporting_rows,
         "profile": best_profile,
+        "secondary_products": secondary_products,
+        "all_product_scores": {p: round(float(s), 3) for p, s in sorted(product_scores.items(), key=lambda x: -x[1])[:6]},
     }
     set_cache(cache_key, result)
     return result
@@ -1028,7 +1900,76 @@ def extract_transcripts_from_file(path: Path) -> List[Dict[str, str]]:
     elif ext == ".txt":
         text = path.read_text(errors='replace')
         return [{"name": path.stem, "text": text}]
+    elif ext == ".json":
+        return extract_from_json(path)
     return []
+
+def extract_from_json(path: Path) -> List[Dict[str, str]]:
+    """Parse a JSON file containing one or many call payloads in the ingest format."""
+    role_map = {"assistant": "bot", "user": "customer"}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as e:
+        log.error(f"JSON parse error {path}: {e}")
+        return []
+
+    # Accept either a single dict or an array of dicts
+    records = raw if isinstance(raw, list) else [raw]
+    items = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        # Normalise: support both unique_call_id (vendor) and sender_id (extracted_logs)
+        call_id = (
+            rec.get("unique_call_id")
+            or rec.get("sender_id")
+            or str(uuid.uuid4())
+        )
+        conv_log = rec.get("conversation_log", [])
+        if not conv_log:
+            continue
+        turns = []
+        for i, msg in enumerate(conv_log, start=1):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "user")
+            content = (msg.get("content") or "").strip()
+            if not content:
+                continue
+            turns.append({
+                "sl": i,
+                "speaker": role_map.get(role, "unknown"),
+                "text": content,
+            })
+        if not turns:
+            continue
+        raw_text = "\n".join(f"{t['speaker']}: {t['text']}" for t in turns)
+        items.append({
+            "name": str(call_id),
+            "sl": str(call_id),
+            "text": raw_text,
+            "source_file": path.name,
+            "turns": turns,
+            "meta": {
+                "intent": rec.get("INTENT"),
+                "stage_code": rec.get("STAGE_CODE"),
+                "sentiment": rec.get("sentiment"),
+                "summary": rec.get("conversation_summary"),
+                "no_of_queries": rec.get("no_of_queries"),
+                "no_of_queries_resolved": rec.get("no_of_queries_resolved"),
+                "call_comp_flag": rec.get("call_comp_flag"),
+                "customer_journey": rec.get("customer_journey", []),
+                "standalone_type": rec.get("standalone_type", []),
+                "sub_query_type": rec.get("sub_query_type", []),
+                "root_dscn": rec.get("root_dscn"),
+                "mid_dscn": rec.get("mid_dscn"),
+                "root_tta": rec.get("root_tta"),
+                "mid_tta": rec.get("mid_tta"),
+                "audio_link": rec.get("audio_link") or "",
+            },
+        })
+    log.info(f"JSON ingest: {path.name} → {len(items)} calls extracted")
+    return items
 
 # ── RAG: Product Spec Retrieval ──────────────────────────────────────────────
 # The local FAISS-backed helpers above handle retrieval and indexing.
@@ -1068,6 +2009,19 @@ PRODUCT EVALUATION:
 - If the bot says it is unable to provide information for a policy/product question, flag it as a system failure and lower the relevant QA scores
 - Every product check must compare the call statement against an exact sentence from the product PDF or indexed product spec
 
+PRODUCT CHECK VERDICT RULES — READ CAREFULLY (these matter for false-positive control):
+- "pass"  → statement is consistent with the spec OR there is no spec sentence available to contradict it. When the bot quotes a SYSTEM-RETRIEVED value (e.g. "your premium is six thousand monthly", "your policy ends on DD/MM/YYYY", "your nominee is X"), default to "pass" UNLESS the spec contradicts it with an explicit different value OR the customer disputes it in the same call.
+- "risk"  → bot's statement is unconfirmed by spec but plausible (e.g. value falls inside a spec range, spec is silent, bot used categorical language like "always/never/guaranteed").
+- "fail"  → bot's statement DIRECTLY CONTRADICTS a specific value in the spec (e.g. spec says "entry age 18-65" and bot says "entry age is 70"), OR the customer explicitly said the bot was wrong, OR the bot promised an unauthorised outcome.
+- DO NOT label as "fail" because the spec says things like "verify from system" / "refer to policy bond" / "as per records" — those are meta-instructions, not contradicting facts.
+- DO NOT label as "fail" because the spec is silent on the topic — that is "risk" at most.
+- DO NOT label as "fail" because the bot quoted a number with no matching number in the spec — the bot may have read from the customer's policy in CRM.
+
+MULTI-PRODUCT HANDLING:
+- If the transcript mentions or strongly implies MORE THAN ONE product, identify ALL of them.
+- Put the most-discussed product in "product_mentioned" and the full ordered list in "products_mentioned".
+- When generating product_checks, attribute each check to the right product by referencing the product name in the "fact" or by adding a "product" field to the check.
+
 CALL CLASSIFICATION:
 - category: One of [Premium Receipt, Premium Payment Assistance, Policy Status Inquiry, Policy Document Request, Surrender Request, Loan Against Policy, Nominee Update, Address or Contact Update, Maturity Claim, Death Claim, Revival of Lapsed Policy, Free Look Cancellation, Rider Inquiry, Fund Switch or Redirection, Partial Withdrawal, Benefit Illustration Request, Complaint or Grievance, Escalation Request, General Inquiry]
 - severity: "normal", "watch", "critical", "fatal"
@@ -1077,9 +2031,12 @@ CALL CLASSIFICATION:
 
 FLAGGING RULES - BE STRICT AND PRECISE:
 - "compliance_breach" ONLY if: privacy laws violated, promised guaranteed outcomes not authorized, shared restricted financial data, violated consumer protection act
-- "false_information" ONLY if: bot stated a product fact that directly contradicts the product spec (wrong premium amount, wrong age limit, wrong benefit amount, etc)
+- "false_information" ONLY if BOTH of these are true:
+    (a) the bot stated a product/policy fact that directly contradicts the product spec (wrong premium amount, wrong age limit, wrong benefit amount, etc) OR the customer explicitly said the bot was wrong in the same call ("that's incorrect", "no that's wrong"); AND
+    (b) you can quote the contradicting spec sentence OR the customer dispute turn.
+  NEVER raise false_information just because the bot quoted a number/date/name that you could not verify against the spec — the bot likely retrieved it from the CRM/system.
 - "regulatory_violation" ONLY if: violated RBI/IRDAI rules, illegal solicitation, improper disclosure
-- "behavior_issue" ONLY if: escalation needed but call ended without escalating, customer clearly in distress with no empathy shown, obvious system loop or malfunction
+- "behavior_issue" ONLY if: the bot says it CANNOT access the data the customer asked for (system failure), OR escalation needed but call ended without escalating, OR customer clearly in distress with no empathy shown, OR obvious system loop / malfunction
 - DO NOT flag for: customer saying "I already have a policy", "I see one product purchased", "I'm looking for", normal questions, normal observations
 - DO NOT flag for: vague responses unless they violate compliance or are about product facts
 - DO NOT flag for: missing information unless the bot explicitly said something false or violated a rule
@@ -1117,7 +2074,8 @@ OUTPUT FORMAT — respond with ONLY this JSON structure:
   "fatal_reason": "<string or empty string>",
   "flags": [<array of flag strings: only actual compliance_breach, false_information, regulatory_violation, or behavior_issue if they occurred; empty array if no violations>],
   "sentiment": "<positive|neutral|frustrated|angry|distressed>",
-  "product_mentioned": "<product name or 'None'>",
+  "product_mentioned": "<primary product name or 'None'>",
+  "products_mentioned": [<full list of every product mentioned/implied in the call; empty array if none>],
     "product_confidence": <0-1 float>,
     "product_signals": ["keywords or product details that drove the match"],
   "product_accuracy_score": <1-5 or null>,
@@ -1125,7 +2083,7 @@ OUTPUT FORMAT — respond with ONLY this JSON structure:
   "what_should_have_been_said": "<specific suggestions for improvement>",
   "strengths": "<what the bot did well>",
   "summary": "<2-3 sentence overall call summary>",
-    "product_checks": [{"call":"<call id if available>","stmt":"<exact bot statement>","fact":"<knowledge base fact>","verdict":"pass|fail|risk","vtext":"✓ ACCURATE|✗ INACCURATE|⚠️ CONDITIONALLY OK","risk":"None|🚨 HIGH — reason|⚠️ Medium — reason"}],
+    "product_checks": [{"call":"<call id if available>","product":"<which product this check refers to>","stmt":"<exact bot statement>","fact":"<knowledge base fact>","verdict":"pass|fail|risk","vtext":"✓ ACCURATE|✗ INACCURATE|⚠️ CONDITIONALLY OK","risk":"None|🚨 HIGH — reason|⚠️ Medium — reason"}],
   "turn_count": <integer>,
   "bot_turns": <integer>,
   "customer_turns": <integer>,
@@ -1270,6 +2228,26 @@ async def process_realtime_call(job_id: str, item: dict):
 
         analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
 
+        # Fill product context fields so policy rules & best-spec lookup work correctly
+        if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
+            analysis["product_mentioned"] = detected_product
+        analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
+        analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
+        analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
+        analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
+        analysis.setdefault("product_checks", [])
+        analysis.setdefault("product_profile", rag_hit.get("profile", {}))
+        analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
+        analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
+        analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
+
+        # Sentiment refinement + QA safety-net rules (same as batch path)
+        analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
+        if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
+            analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
+        analysis = _apply_qa_policy_rules(analysis, turns)
+        analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
+
         # --- Overlay voicebot metadata where available ---
         if meta.get("intent"):
             analysis["voicebot_intent"] = meta["intent"]
@@ -1361,11 +2339,14 @@ async def process_job(job_id: str, file_paths: List[Path]):
             if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
                 analysis["product_mentioned"] = detected_product
             analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
+            analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
             analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
             analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
             analysis.setdefault("product_checks", [])
             analysis.setdefault("product_profile", rag_hit.get("profile", {}))
             analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
+            analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
+            analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
             analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
             if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
                 analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
@@ -1415,11 +2396,17 @@ async def serve_frontend():
 async def upload_files(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
     if not files:
         raise HTTPException(400, "No files provided")
-    
+
+    ALLOWED = {".xlsx", ".xls", ".pdf", ".docx", ".doc", ".txt", ".json"}
+    for f in files:
+        ext = Path(f.filename).suffix.lower()
+        if ext not in ALLOWED:
+            raise HTTPException(400, f"Unsupported file type: {f.filename}. Allowed: {', '.join(sorted(ALLOWED))}")
+
     job_id = str(uuid.uuid4())
     job_dir = UPLOAD_DIR / job_id
     job_dir.mkdir(parents=True)
-    
+
     saved_paths = []
     for f in files:
         dest = job_dir / f.filename
@@ -1445,63 +2432,34 @@ async def upload_files(background_tasks: BackgroundTasks, files: List[UploadFile
     return {"job_id": job_id, "files_received": len(files), "status": "queued"}
 from fastapi import Request
 
-@app.post("/api/ingest-call")
-async def ingest_realtime_call(request: Request, background_tasks: BackgroundTasks):
-    """Receive a real-time call payload in the voicebot API format."""
-    # Optional API key enforcement: set INGEST_API_KEY in environment to require a token
-    expected_key = _env("INGEST_API_KEY", "")
-    if expected_key:
-        # Accept either Authorization: Bearer <token> or X-API-Key: <token>
-        auth = request.headers.get("authorization", "") or request.headers.get("Authorization", "")
-        api_key_header = request.headers.get("x-api-key", "") or request.headers.get("X-API-Key", "")
-        provided = None
-        if auth and auth.lower().startswith("bearer "):
-            provided = auth.split(" ", 1)[1].strip()
-        elif api_key_header:
-            provided = api_key_header.strip()
-        if not provided or provided != expected_key:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-    payload = await request.json()
-
-    # Map conversation_log roles to your internal speaker format
+def _build_ingest_item(payload: dict) -> dict:
+    """Build a normalised item dict from a single call payload (vendor or extracted_logs format)."""
     role_map = {"assistant": "bot", "user": "customer"}
+    # Support both unique_call_id (vendor) and sender_id (extracted_logs)
+    call_name = (
+        payload.get("unique_call_id")
+        or payload.get("sender_id")
+        or str(uuid.uuid4())
+    )
     turns = []
     for i, msg in enumerate(payload.get("conversation_log", []), start=1):
+        if not isinstance(msg, dict):
+            continue
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
         turns.append({
             "sl": i,
             "speaker": role_map.get(msg.get("role", "user"), "unknown"),
-            "text": (msg.get("content") or "").strip()
+            "text": content,
         })
-
-    call_name = payload.get("unique_call_id", str(uuid.uuid4()))
-    raw_text = "\n".join(
-        f"{t['speaker']}: {t['text']}" for t in turns
-    )
-
-    # Create a synthetic job for this single call
-    job_id = str(uuid.uuid4())
-    db = load_db()
-    db["jobs"].append({
-        "id": job_id,
-        "status": "queued",
-        "files": [f"realtime:{call_name}"],
-        "total": 1,
-        "processed": 0,
-        "fatal_count": 0,
-        "flag_count": 0,
-        "created_at": datetime.now().isoformat(),
-        "completed_at": None
-    })
-    save_db(db)
-
-    # Pass extra metadata from the payload into the item
-    item = {
-        "name": call_name,
+    raw_text = "\n".join(f"{t['speaker']}: {t['text']}" for t in turns)
+    return {
+        "name": str(call_name),
         "text": raw_text,
-        "sl": payload.get("unique_call_id", ""),
+        "sl": str(call_name),
         "source_file": "realtime",
-        "turns": turns,                          # pre-parsed, skip re-parsing
+        "turns": turns,
         "meta": {
             "intent": payload.get("INTENT"),
             "stage_code": payload.get("STAGE_CODE"),
@@ -1517,12 +2475,86 @@ async def ingest_realtime_call(request: Request, background_tasks: BackgroundTas
             "mid_dscn": payload.get("mid_dscn"),
             "root_tta": payload.get("root_tta"),
             "mid_tta": payload.get("mid_tta"),
-            "audio_link": payload.get("audio_link", ""),
-        }
+            "audio_link": payload.get("audio_link") or "",
+        },
     }
 
-    background_tasks.add_task(process_realtime_call, job_id, item)
-    return {"job_id": job_id, "call_id": call_name, "status": "queued"}
+@app.post("/api/ingest-call")
+async def ingest_realtime_call(request: Request, background_tasks: BackgroundTasks):
+    """Receive one or many call payloads in the voicebot API format.
+
+    Accepts:
+      - Single call object  : { "unique_call_id": "...", "conversation_log": [...], ... }
+      - Array of call objects: [ { "sender_id": "...", "conversation_log": [...] }, ... ]
+
+    Both vendor single-call pushes and bulk extracted_logs arrays are supported.
+    """
+    # Auth check (Bearer token or X-API-Key)
+    expected_key = _env("INGEST_API_KEY", "")
+    if expected_key:
+        auth = request.headers.get("authorization", "") or request.headers.get("Authorization", "")
+        api_key_header = request.headers.get("x-api-key", "") or request.headers.get("X-API-Key", "")
+        provided = None
+        if auth and auth.lower().startswith("bearer "):
+            provided = auth.split(" ", 1)[1].strip()
+        elif api_key_header:
+            provided = api_key_header.strip()
+        if not provided or provided != expected_key:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    body = await request.json()
+
+    # ── Single call (vendor default) ────────────────────────────────────────
+    if isinstance(body, dict):
+        item = _build_ingest_item(body)
+        if not item["turns"]:
+            raise HTTPException(status_code=422, detail="conversation_log has no valid messages")
+        job_id = str(uuid.uuid4())
+        db = load_db()
+        db["jobs"].append({
+            "id": job_id, "status": "queued",
+            "files": [f"realtime:{item['name']}"],
+            "total": 1, "processed": 0,
+            "fatal_count": 0, "flag_count": 0,
+            "created_at": datetime.now().isoformat(), "completed_at": None,
+        })
+        save_db(db)
+        background_tasks.add_task(process_realtime_call, job_id, item)
+        return {"job_id": job_id, "call_id": item["name"], "status": "queued"}
+
+    # ── Array of calls (extracted_logs / bulk) ───────────────────────────────
+    if isinstance(body, list):
+        if not body:
+            raise HTTPException(status_code=422, detail="Empty array")
+        results, skipped = [], []
+        for record in body:
+            if not isinstance(record, dict):
+                skipped.append({"reason": "not an object"})
+                continue
+            item = _build_ingest_item(record)
+            if not item["turns"]:
+                skipped.append({"call_id": item["name"], "reason": "no valid messages"})
+                continue
+            job_id = str(uuid.uuid4())
+            db = load_db()
+            db["jobs"].append({
+                "id": job_id, "status": "queued",
+                "files": [f"realtime:{item['name']}"],
+                "total": 1, "processed": 0,
+                "fatal_count": 0, "flag_count": 0,
+                "created_at": datetime.now().isoformat(), "completed_at": None,
+            })
+            save_db(db)
+            background_tasks.add_task(process_realtime_call, job_id, item)
+            results.append({"job_id": job_id, "call_id": item["name"], "status": "queued"})
+        return {
+            "queued": len(results),
+            "skipped": len(skipped),
+            "results": results,
+            "skipped_details": skipped,
+        }
+
+    raise HTTPException(status_code=422, detail="Payload must be a call object or array of call objects")
 
 @app.post("/api/upload-products")
 async def upload_product_specs(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
@@ -1676,6 +2708,7 @@ async def get_calls(
             "sentiment": a.get("sentiment",""),
             "flags": a.get("flags",[]),
             "product_mentioned": a.get("product_mentioned",""),
+            "products_mentioned": a.get("products_mentioned", []),
             "product_confidence": a.get("product_confidence", 0.0),
             "product_signals": a.get("product_signals", []),
             "fatal": c.get("fatal",False),
@@ -1729,6 +2762,7 @@ async def export_calls_excel():
             "failed_parameters": ", ".join(a.get("failed_parameters", [])),
             "flags": ", ".join(a.get("flags", [])),
             "product_mentioned": a.get("product_mentioned", ""),
+            "products_mentioned": ", ".join(a.get("products_mentioned", []) or []),
             "product_confidence": a.get("product_confidence", 0),
             "product_signals": ", ".join(a.get("product_signals", [])),
             "product_accuracy_score": a.get("product_accuracy_score", ""),

@@ -5,6 +5,7 @@
 
 const API = '';  // same origin
 const AUTO_REFRESH_MS = 15 * 60 * 1000;
+const LIVE_POLL_MS = 3000;          // fast poll while any job is running
 let currentView = 'dashboard';
 let currentPage = 1;
 let pageSize = 50;
@@ -12,11 +13,13 @@ let totalCalls = 0;
 let sortBy = 'processed_at';
 let sortDir = 'desc';
 let searchTimeout = null;
-let pollingInterval = null;
+let pollingInterval = null;          // slow background refresh
+let livePollInterval = null;         // fast poll while jobs are running
 let pendingJobs = new Set();
 let activeCallDetailId = null;
 let activeCallSequence = [];
 let activeCallIndex = -1;
+let lastKnownCallCount = 0;          // detect newly-arrived calls during live poll
 
 // Chart instances
 let radarChart, distChart, sevChart, catChart, sentChart, volChart, productChart, productConfidenceChart;
@@ -27,18 +30,108 @@ document.addEventListener('DOMContentLoaded', () => {
   loadDashboard();
   loadFatalCalls();
   startPolling();
+  discoverPendingJobs();   // pick up jobs that were already running before page load
 });
 
 function startPolling() {
+  // Slow background refresh (every 15 min) — for steady-state stats
   pollingInterval = setInterval(() => {
-    if (pendingJobs.size > 0) {
-      pollJobs();
-    }
     if (currentView === 'dashboard') loadDashboard();
     if (currentView === 'calls') loadCalls();
     if (currentView === 'fatal') loadFatalCalls();
     if (currentView === 'products') loadProductSpecs();
   }, AUTO_REFRESH_MS);
+}
+
+// Ask backend whether any jobs are still processing (e.g. after a page refresh
+// or when vendor pushed calls via /api/ingest-call while the dashboard was open).
+async function discoverPendingJobs() {
+  try {
+    const jobs = await fetch(`${API}/api/jobs`).then(r => r.json());
+    const arr = Array.isArray(jobs) ? jobs : (jobs.jobs || []);
+    arr.forEach(j => {
+      if (j && j.id && (j.status === 'queued' || j.status === 'processing')) {
+        pendingJobs.add(j.id);
+      }
+    });
+    if (pendingJobs.size > 0) startLivePolling();
+  } catch {}
+}
+
+// Fast poll loop — only runs while jobs are pending. Auto-stops when done.
+function startLivePolling() {
+  if (livePollInterval) return;        // already running
+  showLivePill(true);
+  livePollInterval = setInterval(livePollTick, LIVE_POLL_MS);
+  livePollTick();                      // immediate first tick
+}
+
+function stopLivePolling() {
+  if (livePollInterval) {
+    clearInterval(livePollInterval);
+    livePollInterval = null;
+  }
+  showLivePill(false);
+}
+
+async function livePollTick() {
+  if (pendingJobs.size === 0) { stopLivePolling(); return; }
+
+  let totalQueued = 0, totalProcessed = 0, anyStillRunning = false;
+  const jobIds = Array.from(pendingJobs);
+
+  await Promise.all(jobIds.map(async (jid) => {
+    try {
+      const job = await fetch(`${API}/api/jobs/${jid}`).then(r => r.json());
+      if (!job || !job.id) { pendingJobs.delete(jid); return; }
+      totalQueued    += (job.total || 0);
+      totalProcessed += (job.processed || 0);
+      if (job.status === 'completed' || job.status === 'failed') {
+        pendingJobs.delete(jid);
+      } else {
+        anyStillRunning = true;
+      }
+    } catch {}
+  }));
+
+  updateLivePill(totalProcessed, totalQueued);
+  updateLiveStrip(totalProcessed, totalQueued, pendingJobs.size);
+
+  // Refresh visible views so newly-finished calls appear as they complete
+  if (currentView === 'dashboard') loadDashboard({ silent: true });
+  if (currentView === 'calls')     loadCalls({ silent: true });
+  if (currentView === 'fatal')     loadFatalCalls({ silent: true });
+  if (currentView === 'jobs')      loadJobs({ silent: true });
+
+  if (!anyStillRunning && pendingJobs.size === 0) {
+    stopLivePolling();
+    showToast('All calls processed', 'success');
+  }
+}
+
+function showLivePill(on) {
+  const pill = document.getElementById('live-processing-pill');
+  if (pill) pill.style.display = on ? 'inline-flex' : 'none';
+  const strip = document.getElementById('live-job-strip');
+  if (strip) strip.style.display = on ? 'flex' : 'none';
+}
+
+function updateLivePill(done, total) {
+  const txt = document.getElementById('live-processing-text');
+  if (!txt) return;
+  if (total > 0) txt.textContent = `Processing ${done}/${total}`;
+  else           txt.textContent = `Processing ${pendingJobs.size} job(s)…`;
+}
+
+function updateLiveStrip(done, total, jobCount) {
+  const fill  = document.getElementById('live-job-fill');
+  const count = document.getElementById('live-job-count');
+  const title = document.getElementById('live-job-title');
+  if (fill)  fill.style.width = (total > 0 ? Math.round(done/total*100) : 0) + '%';
+  if (count) count.textContent = total > 0 ? `${done} / ${total} calls` : `${jobCount} job(s) queued`;
+  if (title) title.textContent = jobCount > 1
+    ? `Processing calls from ${jobCount} jobs…`
+    : `Processing calls…`;
 }
 
 async function checkHealth() {
@@ -795,7 +888,7 @@ function handleFileSelect(e) {
   addFiles(Array.from(e.target.files));
 }
 function addFiles(files) {
-  const allowed = ['.pdf','.docx','.xlsx','.xls','.txt'];
+  const allowed = ['.pdf','.docx','.xlsx','.xls','.txt','.json'];
   files.forEach(f => {
     const ext = '.' + f.name.split('.').pop().toLowerCase();
     if (allowed.includes(ext)) selectedFiles.push(f);
@@ -843,6 +936,7 @@ async function submitUpload() {
       renderFileList();
       showToast(`Upload successful! Job ${data.job_id.slice(0,8)}… started`, 'success');
       pollJobProgress(data.job_id);
+      startLivePolling();   // <-- live dashboard updates while job runs
     }
   } catch(e) {
     showToast('Upload failed: ' + e.message, 'error');
@@ -1043,13 +1137,9 @@ async function loadJobs() {
   } catch(e) { console.error('Jobs error:', e); }
 }
 
+// Legacy alias retained for safety — delegates to the new live poller.
 async function pollJobs() {
-  for (const jobId of pendingJobs) {
-    try {
-      const job = await fetch(`${API}/api/jobs/${jobId}`).then(r=>r.json());
-      if (job.status === 'completed') pendingJobs.delete(jobId);
-    } catch {}
-  }
+  if (pendingJobs.size > 0) startLivePolling();
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────

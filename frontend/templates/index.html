@@ -9,6 +9,40 @@
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@500;600;700;800&family=Source+Sans+3:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <link rel="stylesheet" href="/static/css/main.css">
+<style>
+  @keyframes livePulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: .4; transform: scale(.7); }
+  }
+  .live-call-row { animation: fadeInRow .35s ease-out; }
+  @keyframes fadeInRow {
+    from { background: rgba(124,58,237,.18); transform: translateY(-4px); opacity: 0; }
+    to   { background: transparent; transform: translateY(0); opacity: 1; }
+  }
+  #live-job-strip {
+    display: none;
+    align-items: center; gap: 14px;
+    padding: 10px 16px; margin: 0 0 16px;
+    background: linear-gradient(90deg, rgba(37,99,235,.08), rgba(124,58,237,.08));
+    border: 1px solid rgba(124,58,237,.25);
+    border-radius: 10px;
+    font-size: 13px;
+  }
+  #live-job-strip .lj-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #7c3aed;
+    animation: livePulse 1.2s ease-in-out infinite;
+  }
+  #live-job-strip .lj-bar {
+    flex: 1; height: 6px; border-radius: 4px;
+    background: rgba(124,58,237,.15); overflow: hidden;
+  }
+  #live-job-strip .lj-bar-fill {
+    height: 100%; width: 0%;
+    background: linear-gradient(90deg, #2563eb, #7c3aed);
+    transition: width .4s ease;
+  }
+</style>
 </head>
 <body>
 
@@ -78,6 +112,10 @@
         <svg viewBox="0 0 24 24"><path d="M12 2L1 21h22L12 2z"/></svg>
         <span id="alert-text"></span>
       </div>
+      <div id="live-processing-pill" style="display:none;align-items:center;gap:8px;padding:6px 12px;background:linear-gradient(90deg,#2563eb,#7c3aed);color:#fff;border-radius:20px;font-size:13px;font-weight:600;box-shadow:0 2px 8px rgba(37,99,235,.3);">
+        <span style="display:inline-block;width:8px;height:8px;background:#fff;border-radius:50%;animation:livePulse 1.2s ease-in-out infinite;"></span>
+        <span id="live-processing-text">Processing…</span>
+      </div>
       <button class="btn-icon" onclick="refreshAll()" title="Refresh">
         <svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0012 4a8 8 0 00-8 8 8 8 0 008 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18a6 6 0 01-6-6 6 6 0 016-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
       </button>
@@ -86,6 +124,14 @@
 
   <!-- ═══════════════════════════════════════════════════════ DASHBOARD VIEW -->
   <section class="view active" id="view-dashboard">
+
+    <!-- Live processing strip (shown only while jobs run) -->
+    <div id="live-job-strip">
+      <span class="lj-dot"></span>
+      <div style="font-weight:600;color:var(--text-1,#111);" id="live-job-title">Processing calls…</div>
+      <div class="lj-bar"><div class="lj-bar-fill" id="live-job-fill"></div></div>
+      <div id="live-job-count" style="font-variant-numeric:tabular-nums;color:var(--text-2,#444);font-weight:600;">0 / 0</div>
+    </div>
 
     <!-- KPI Row -->
     <div class="kpi-row">
@@ -299,7 +345,7 @@
             <span>Multiple files • Multiple transcripts per file • Excel with SL column</span>
           </div>
           <label class="btn-primary upload-btn">
-            <input type="file" id="file-input" multiple accept=".pdf,.docx,.xlsx,.xls,.txt" onchange="handleFileSelect(event)" style="display:none">
+            <input type="file" id="file-input" multiple accept=".pdf,.docx,.xlsx,.xls,.txt,.json" onchange="handleFileSelect(event)" style="display:none">
             Browse Files
           </label>
         </div>
@@ -322,6 +368,10 @@
             <div class="format-item">
               <div class="format-icon txt">TXT</div>
               <div>Raw transcript text • Bot/Customer labels required</div>
+            </div>
+            <div class="format-item">
+              <div class="format-icon" style="background:var(--accent-2,#f5a623);color:#fff;font-size:11px;font-weight:700;border-radius:6px;padding:6px 10px;">JSON</div>
+              <div>Single call object <em>or</em> array of calls — vendor / extracted_logs format</div>
             </div>
           </div>
           <div class="transcript-example">
