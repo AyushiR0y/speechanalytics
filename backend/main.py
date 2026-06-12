@@ -203,7 +203,6 @@ def _safe_filename_label(name: str) -> str:
     stem = re.sub(r"(?i)product\s*circular", "", stem)
     stem = re.sub(r"[_\-]+", " ", stem)
     stem = re.sub(r"\s+", " ", stem).strip()
-    stem = re.sub(r"\b(V\d+|v\d+)\b", "", stem).strip()
     stem = re.sub(r"(?i)\bbajaj\s+allianz\s+life\b", "Bajaj Life", stem).strip()
     stem = re.sub(r"\s{2,}", " ", stem).strip(" -_")
     return stem or Path(name).stem
@@ -1445,15 +1444,153 @@ def _load_rag_index():
         return None, []
 
 
-def rebuild_product_rag_index() -> dict:
-    """Build or rebuild the local product knowledge base.
+# def rebuild_product_rag_index() -> dict:
+#     """Build or rebuild the local product knowledge base.
 
-    Optimisation: maintains a signature file at PROC_DIR / 'rag_signature.json'
-    listing {file_name: sha1}. If every PDF/doc in the products folder still
-    matches its previous sha1, we skip re-embedding entirely. Otherwise we
-    re-embed only the chunks of changed files (cached embeddings for unchanged
-    files are reused via PROC_DIR / 'embed_cache.npz').
-    """
+#     Optimisation: maintains a signature file at PROC_DIR / 'rag_signature.json'
+#     listing {file_name: sha1}. If every PDF/doc in the products folder still
+#     matches its previous sha1, we skip re-embedding entirely. Otherwise we
+#     re-embed only the chunks of changed files (cached embeddings for unchanged
+#     files are reused via PROC_DIR / 'embed_cache.npz').
+#     """
+#     files = _collect_product_files()
+#     meta_rows: List[Dict[str, Any]] = []
+
+#     if not files:
+#         if RAG_INDEX_FILE.exists():
+#             RAG_INDEX_FILE.unlink(missing_ok=True)
+#         RAG_META_FILE.write_text("[]")
+#         _save_rag_backend("empty")
+#         # also clear cached signature so a future upload triggers a rebuild
+#         sig_path = PROC_DIR / "rag_signature.json"
+#         if sig_path.exists():
+#             sig_path.unlink(missing_ok=True)
+#         return {"mode": "empty", "chunks": 0, "products": 0}
+
+#     # ---- 1. compute current signature ----
+#     sig_path = PROC_DIR / "rag_signature.json"
+#     embed_cache_path = PROC_DIR / "embed_cache.npz"
+#     current_sig: Dict[str, str] = {}
+#     for path in files:
+#         try:
+#             current_sig[path.name] = hashlib.sha1(path.read_bytes()).hexdigest()
+#         except Exception:
+#             current_sig[path.name] = f"{path.name}:{path.stat().st_size}"
+
+#     prev_sig: Dict[str, str] = {}
+#     try:
+#         prev_sig = json.loads(sig_path.read_text())
+#     except Exception:
+#         prev_sig = {}
+
+#     everything_unchanged = (
+#         prev_sig == current_sig
+#         and RAG_INDEX_FILE.exists()
+#         and RAG_META_FILE.exists()
+#         and embed_cache_path.exists()
+#     )
+#     if everything_unchanged:
+#         log.info("RAG index already up to date — skipping re-embed.")
+#         meta = _load_rag_meta()
+#         return {
+#             "mode": (json.loads(RAG_BACKEND_FILE.read_text()).get("mode", "faiss")
+#                      if RAG_BACKEND_FILE.exists() else "faiss"),
+#             "chunks": len(meta),
+#             "products": len(files),
+#             "cache": "hit",
+#         }
+
+#     # ---- 2. load existing embedding cache (key: sha1(chunk text)) ----
+#     embed_cache: Dict[str, np.ndarray] = {}
+#     if embed_cache_path.exists():
+#         try:
+#             with np.load(str(embed_cache_path), allow_pickle=False) as npz:
+#                 # store as one matrix + key list, keyed by sha1 strings
+#                 cache_keys = npz["keys"].tolist() if "keys" in npz else []
+#                 cache_mat = npz["vecs"] if "vecs" in npz else np.zeros((0, 0))
+#                 for i, k in enumerate(cache_keys):
+#                     embed_cache[k] = cache_mat[i]
+#             log.info(f"Loaded {len(embed_cache)} cached embeddings.")
+#         except Exception as e:
+#             log.warning(f"Embed cache load failed (rebuilding): {e}")
+#             embed_cache = {}
+
+#     try:
+#         model = _load_embedder()  # ensures model is loaded once
+#         chunk_texts: List[str] = []
+#         chunk_keys: List[str] = []
+#         for path in files:
+#             doc_text = _document_text(path)
+#             if not doc_text.strip():
+#                 continue
+#             chunks = _chunk_text(doc_text)
+#             product_label = _safe_filename_label(path.name)
+#             for chunk_idx, chunk in enumerate(chunks):
+#                 chunk_texts.append(chunk)
+#                 chunk_keys.append(hashlib.sha1(chunk.encode("utf-8")).hexdigest())
+#                 meta_rows.append({
+#                     "source": path.name,
+#                     "path": str(path),
+#                     "product": product_label,
+#                     "chunk_index": chunk_idx,
+#                     "text": chunk,
+#                     "word_count": len(chunk.split()),
+#                     "page": None,
+#                 })
+
+#         if not chunk_texts:
+#             RAG_META_FILE.write_text("[]")
+#             _save_rag_backend("empty")
+#             sig_path.write_text(json.dumps(current_sig, indent=2))
+#             return {"mode": "empty", "chunks": 0, "products": len(files)}
+
+#         # ---- 3. only embed chunks we don't already have ----
+#         missing_idx = [i for i, k in enumerate(chunk_keys) if k not in embed_cache]
+#         if missing_idx:
+#             log.info(f"Embedding {len(missing_idx)} new chunks (cached: {len(chunk_keys) - len(missing_idx)}).")
+#             new_vecs = _embed_texts([chunk_texts[i] for i in missing_idx])
+#             for vec, i in zip(new_vecs, missing_idx):
+#                 embed_cache[chunk_keys[i]] = vec.astype(np.float32)
+#         else:
+#             log.info("All chunks already cached — no embedding calls made.")
+
+#         # Materialise the full vector matrix in the right order
+#         vectors = np.vstack([embed_cache[k] for k in chunk_keys]).astype(np.float32)
+
+#         if faiss is not None:
+#             index = faiss.IndexFlatIP(vectors.shape[1])
+#             index.add(vectors)
+#             faiss.write_index(index, str(RAG_INDEX_FILE))
+#             _save_rag_backend("faiss")
+#         else:
+#             RAG_INDEX_FILE.write_text("")
+#             _save_rag_backend("keyword")
+
+#         RAG_META_FILE.write_text(json.dumps(meta_rows, indent=2, default=str))
+
+#         # ---- 4. persist signature + cache ----
+#         sig_path.write_text(json.dumps(current_sig, indent=2))
+#         try:
+#             keys_arr = np.array(list(embed_cache.keys()))
+#             vecs_arr = np.vstack(list(embed_cache.values())).astype(np.float32)
+#             np.savez_compressed(str(embed_cache_path), keys=keys_arr, vecs=vecs_arr)
+#         except Exception as e:
+#             log.warning(f"Embed cache write failed: {e}")
+
+#         return {
+#             "mode": "faiss" if faiss is not None else "keyword",
+#             "chunks": len(meta_rows),
+#             "products": len(files),
+#             "cache": "partial" if missing_idx else "full",
+#             "embedded_now": len(missing_idx),
+#         }
+#     except Exception as e:
+#         log.warning(f"Product RAG rebuild failed: {e}")
+#         RAG_META_FILE.write_text("[]")
+#         _save_rag_backend("keyword")
+#         return {"mode": "keyword", "chunks": 0, "products": len(files), "error": str(e)}
+
+def rebuild_product_rag_index() -> dict:
     files = _collect_product_files()
     meta_rows: List[Dict[str, Any]] = []
 
@@ -1462,13 +1599,11 @@ def rebuild_product_rag_index() -> dict:
             RAG_INDEX_FILE.unlink(missing_ok=True)
         RAG_META_FILE.write_text("[]")
         _save_rag_backend("empty")
-        # also clear cached signature so a future upload triggers a rebuild
         sig_path = PROC_DIR / "rag_signature.json"
         if sig_path.exists():
             sig_path.unlink(missing_ok=True)
         return {"mode": "empty", "chunks": 0, "products": 0}
 
-    # ---- 1. compute current signature ----
     sig_path = PROC_DIR / "rag_signature.json"
     embed_cache_path = PROC_DIR / "embed_cache.npz"
     current_sig: Dict[str, str] = {}
@@ -1478,35 +1613,13 @@ def rebuild_product_rag_index() -> dict:
         except Exception:
             current_sig[path.name] = f"{path.name}:{path.stat().st_size}"
 
-    prev_sig: Dict[str, str] = {}
-    try:
-        prev_sig = json.loads(sig_path.read_text())
-    except Exception:
-        prev_sig = {}
+    # ---- (signature short-circuit removed — always rebuild meta_rows) ----
 
-    everything_unchanged = (
-        prev_sig == current_sig
-        and RAG_INDEX_FILE.exists()
-        and RAG_META_FILE.exists()
-        and embed_cache_path.exists()
-    )
-    if everything_unchanged:
-        log.info("RAG index already up to date — skipping re-embed.")
-        meta = _load_rag_meta()
-        return {
-            "mode": (json.loads(RAG_BACKEND_FILE.read_text()).get("mode", "faiss")
-                     if RAG_BACKEND_FILE.exists() else "faiss"),
-            "chunks": len(meta),
-            "products": len(files),
-            "cache": "hit",
-        }
-
-    # ---- 2. load existing embedding cache (key: sha1(chunk text)) ----
+    # ---- load existing embedding cache (key: sha1(chunk text)) ----
     embed_cache: Dict[str, np.ndarray] = {}
     if embed_cache_path.exists():
         try:
             with np.load(str(embed_cache_path), allow_pickle=False) as npz:
-                # store as one matrix + key list, keyed by sha1 strings
                 cache_keys = npz["keys"].tolist() if "keys" in npz else []
                 cache_mat = npz["vecs"] if "vecs" in npz else np.zeros((0, 0))
                 for i, k in enumerate(cache_keys):
@@ -1517,7 +1630,7 @@ def rebuild_product_rag_index() -> dict:
             embed_cache = {}
 
     try:
-        model = _load_embedder()  # ensures model is loaded once
+        model = _load_embedder()
         chunk_texts: List[str] = []
         chunk_keys: List[str] = []
         for path in files:
@@ -1545,7 +1658,6 @@ def rebuild_product_rag_index() -> dict:
             sig_path.write_text(json.dumps(current_sig, indent=2))
             return {"mode": "empty", "chunks": 0, "products": len(files)}
 
-        # ---- 3. only embed chunks we don't already have ----
         missing_idx = [i for i, k in enumerate(chunk_keys) if k not in embed_cache]
         if missing_idx:
             log.info(f"Embedding {len(missing_idx)} new chunks (cached: {len(chunk_keys) - len(missing_idx)}).")
@@ -1555,7 +1667,6 @@ def rebuild_product_rag_index() -> dict:
         else:
             log.info("All chunks already cached — no embedding calls made.")
 
-        # Materialise the full vector matrix in the right order
         vectors = np.vstack([embed_cache[k] for k in chunk_keys]).astype(np.float32)
 
         if faiss is not None:
@@ -1569,7 +1680,6 @@ def rebuild_product_rag_index() -> dict:
 
         RAG_META_FILE.write_text(json.dumps(meta_rows, indent=2, default=str))
 
-        # ---- 4. persist signature + cache ----
         sig_path.write_text(json.dumps(current_sig, indent=2))
         try:
             keys_arr = np.array(list(embed_cache.keys()))
@@ -1590,8 +1700,7 @@ def rebuild_product_rag_index() -> dict:
         RAG_META_FILE.write_text("[]")
         _save_rag_backend("keyword")
         return {"mode": "keyword", "chunks": 0, "products": len(files), "error": str(e)}
-
-
+        
 def _keyword_rank(query: str, meta_rows: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, Any]]:
     terms = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) > 2]
     if not terms:
@@ -2572,11 +2681,8 @@ async def upload_product_specs(background_tasks: BackgroundTasks, files: List[Up
 
 @app.get("/api/product-specs")
 async def list_product_specs():
-    index_data = load_product_index()
-    chunk_map = {
-        entry.get("source", ""): len(entry.get("chunks", []))
-        for entry in index_data.get("products", [])
-    }
+    meta_rows = _load_rag_meta()
+    chunk_map = Counter(row.get("source", "") for row in meta_rows)
 
     specs = []
     for p in sorted(PRODUCT_DIR.glob("*.pdf")):
