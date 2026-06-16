@@ -23,7 +23,15 @@ from docx import Document as DocxDocument
 
 import openai
 from dotenv import load_dotenv
-
+import uuid as _uuid_mod  # already imported as uuid above — no change needed
+ 
+from db import (
+    create_job, update_job, get_job, list_jobs, increment_job_counters,
+    insert_raw_call, get_raw_call,
+    upsert_analyzed_call, get_analyzed_call, delete_analyzed_call,
+    list_analyzed_calls, get_fatal_calls as db_get_fatal_calls,
+    get_dashboard_stats, clear_all_data,
+)
 try:
     import faiss
 except Exception:  # pragma: no cover - optional dependency
@@ -42,7 +50,7 @@ RAG_META_FILE = PROC_DIR / "product_faiss_meta.json"
 RAG_BACKEND_FILE = PROC_DIR / "rag_backend.json"
 RAG_EMBED_MODEL = os.environ.get("RAG_EMBED_MODEL", "all-MiniLM-L6-v2").strip()
 PRODUCT_SOURCES = [PRODUCT_DIR]
-
+os.environ["HF_HUB_DISABLE_SSL_VERIFICATION"] = "1"
 for d in [UPLOAD_DIR, PRODUCT_DIR, PROC_DIR, CHROMA_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -87,14 +95,28 @@ def init_rag():
     except Exception as e:
         log.warning(f"RAG init failed (non-fatal): {e}")
 
+# @app.on_event("startup")
+# async def startup():
+#     init_rag()
+#     clear_expired_cache()  # Clean up any expired cache files
+#     if not DB_FILE.exists():
+#         DB_FILE.write_text(json.dumps({"calls": [], "jobs": []}, indent=2))
+#     if not PRODUCT_INDEX_FILE.exists():
+#         PRODUCT_INDEX_FILE.write_text(json.dumps({"products": []}, indent=2))
 @app.on_event("startup")
 async def startup():
     init_rag()
-    clear_expired_cache()  # Clean up any expired cache files
-    if not DB_FILE.exists():
-        DB_FILE.write_text(json.dumps({"calls": [], "jobs": []}, indent=2))
+    clear_expired_cache()
     if not PRODUCT_INDEX_FILE.exists():
         PRODUCT_INDEX_FILE.write_text(json.dumps({"products": []}, indent=2))
+    # Verify DB connection on startup
+    try:
+        from db import get_conn
+        conn = get_conn()
+        conn.close()
+        log.info("PostgreSQL connection OK")
+    except Exception as e:
+        log.error(f"PostgreSQL connection FAILED: {e}")
 
 # ── Database helpers ─────────────────────────────────────────────────────────
 def load_db() -> dict:
@@ -115,6 +137,33 @@ def load_product_index() -> dict:
 def save_product_index(index_data: dict):
     PRODUCT_INDEX_FILE.write_text(json.dumps(index_data, indent=2, default=str))
 
+USAGE_FILE = PROC_DIR / "api_usage_log.json"
+
+def log_api_usage(model: str, input_tokens: int, output_tokens: int):
+    entry = {"timestamp": datetime.now().isoformat(), "model": model,
+             "input_tokens": input_tokens, "output_tokens": output_tokens}
+    try:
+        existing = json.loads(USAGE_FILE.read_text()) if USAGE_FILE.exists() else []
+        existing.append(entry)
+        USAGE_FILE.write_text(json.dumps(existing, indent=2))
+    except Exception as e:
+        log.warning(f"Usage log error: {e}")
+
+# ── Job Control ───────────────────────────────────────────────────────────────
+# In-memory store for cancellation/pause signals.
+# Keys are job_ids, values are "cancel" | "pause" | "resume"
+_job_control: Dict[str, str] = {}
+
+def signal_job(job_id: str, signal: str):
+    """Send a control signal to a running job."""
+    _job_control[job_id] = signal
+
+def check_job_signal(job_id: str) -> Optional[str]:
+    """Check if a job has a pending control signal. Clears it after reading."""
+    return _job_control.get(job_id)
+
+def clear_job_signal(job_id: str):
+    _job_control.pop(job_id, None)
 
 # ── Cache System (long-lived: expires in 2+ weeks) ──────────────────────────
 CACHE_DIR = PROC_DIR / "cache"
@@ -207,7 +256,45 @@ def _safe_filename_label(name: str) -> str:
     stem = re.sub(r"\s{2,}", " ", stem).strip(" -_")
     return stem or Path(name).stem
 
+_PARAM_WEIGHTS = {
+    "greeting_opening": 5,
+    "query_understanding": 10,
+    "response_accuracy": 25,
+    "communication_quality": 8,
+    "compliance": 20,
+    "personalisation": 5,
+    "empathy_soft_skills": 5,
+    "resolution": 10,
+    "system_behaviour": 10,
+    "closing_interaction": 2,
+}
 
+_PARAM_MIN_PASS = {
+    "greeting_opening": 3,
+    "query_understanding": 3,
+    "response_accuracy": 4,
+    "communication_quality": 3,
+    "compliance": 4,
+    "personalisation": 3,
+    "empathy_soft_skills": 3,
+    "resolution": 3,
+    "system_behaviour": 3,
+    "closing_interaction": 3,
+}
+
+def _compute_weighted_score(scores: Dict[str, Any]) -> float:
+    """Always compute server-side — never trust the model's weighted_score."""
+    total_weight = sum(_PARAM_WEIGHTS.values())  # 100
+    weighted = sum(
+        float(scores.get(k, 3) or 3) * w
+        for k, w in _PARAM_WEIGHTS.items()
+    )
+    # Scores are 1-5, weights sum to 100, so max = 5*100 = 500
+    # Normalise to 0-100
+    return round(weighted / 5.0 * (100 / total_weight), 2)
+
+def _compute_failed_parameters(scores: Dict[str, Any]) -> List[str]:
+    return [k for k, min_v in _PARAM_MIN_PASS.items() if int(scores.get(k, 0) or 0) < min_v]
 PARAM_ORDER = [
     "greeting_opening", "query_understanding", "response_accuracy", "communication_quality",
     "compliance", "personalisation", "empathy_soft_skills", "resolution",
@@ -388,6 +475,8 @@ def _best_spec_sentence(statement: str, analysis: Dict[str, Any], keywords: List
             candidate_products.add(p)
 
     search_rows = list(analysis.get("product_evidence") or [])
+    if not search_rows:
+        search_rows = _load_rag_meta()
     profile = analysis.get("product_profile") or {}
 
     # Build the search text pool, biased toward the right product.
@@ -834,6 +923,43 @@ def _build_product_checks(turns: List[Dict[str, Any]], analysis: Dict[str, Any])
     product_name = str(analysis.get("product_mentioned") or "None").strip()
     if not product_name or product_name == "None":
         return []
+        # ── NEW: skip if no matching spec exists for this product ────────────────
+    # AFTER — use the full indexed catalog, not just this call's retrieved chunks
+    _all_meta = _load_rag_meta()
+    available_rag_products = {
+        _safe_filename_label(row.get("product") or "").lower()
+        for row in _all_meta
+        if row.get("product")
+    } if _all_meta else {
+        # fallback: still use call evidence if meta file is missing
+        _safe_filename_label(row.get("product") or "").lower()
+        for row in (analysis.get("product_evidence") or [])
+        if row.get("product")
+    }
+    product_lower = product_name.lower()
+    # has_matching_spec = any(
+    #     product_lower in p or p in product_lower
+    #     or any(w in p for w in product_lower.split() if len(w) > 3)
+    #     for p in available_rag_products
+    # )
+    # if not has_matching_spec:
+    #     log.info(f"[QA] No matching RAG spec for '{product_name}' — skipping rule checks")
+    #     return []
+    def _word_overlap_ratio(a: str, b: str) -> float:
+        wa = set(w for w in a.lower().split() if len(w) > 2)
+        wb = set(w for w in b.lower().split() if len(w) > 2)
+        if not wa or not wb:
+            return 0.0
+        return len(wa & wb) / min(len(wa), len(wb))
+
+    has_matching_spec = any(
+        _word_overlap_ratio(product_lower, p) >= 0.5
+        for p in available_rag_products
+    )
+    if not has_matching_spec:
+        log.info(f"[QA] No matching RAG spec for '{product_name}' (available: {list(available_rag_products)}) — skipping rule checks")
+        return []
+    # ── end guard ────────────────────────────────────────────────────────────
 
     # Skip topics the model has already produced a check for
     existing_topics = set()
@@ -942,7 +1068,27 @@ def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]
             continue
         seen_pairs.add(key)
         merged_checks.append(check)
-    analysis["product_checks"] = merged_checks[:6]
+    # analysis["product_checks"] = merged_checks[:6]
+    # product_checks = analysis["product_checks"]
+    # Filter out fail/risk checks that reference a different product's spec
+    named_product = _safe_filename_label(
+        str(analysis.get("product_mentioned") or "None")
+    ).lower()
+    filtered_checks: List[Dict[str, Any]] = []
+    for c in merged_checks:
+        check_product = _safe_filename_label(str(c.get("product") or "")).lower()
+        verdict = (c.get("verdict") or "").lower()
+        if check_product and check_product not in {"none", "unknown", ""}:
+            same_product = (check_product in named_product) or (named_product in check_product)
+            if not same_product and verdict in {"fail", "risk"}:
+                log.info(
+                    f"[QA] Dropping cross-product check: '{check_product}' "
+                    f"vs call product '{named_product}'"
+                )
+                continue
+        filtered_checks.append(c)
+
+    analysis["product_checks"] = filtered_checks[:6]
     product_checks = analysis["product_checks"]
 
     # ------------------------------------------------------------------
@@ -1152,6 +1298,12 @@ def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]
         analysis["severity"] = "watch"
     if analysis.get("pass_fail") not in {"PASS", "FAIL"}:
         analysis["pass_fail"] = "FAIL" if failed_parameters else "PASS"
+    # Always recompute — 4o mini's arithmetic is unreliable
+    analysis["weighted_score"] = _compute_weighted_score(analysis.get("scores", {}))
+    analysis["failed_parameters"] = list(dict.fromkeys(
+        _compute_failed_parameters(analysis.get("scores", {})) + analysis.get("failed_parameters", [])
+    ))
+    analysis["pass_fail"] = "FAIL" if analysis["failed_parameters"] or analysis.get("severity") == "fatal" else "PASS"
     return analysis
 
 
@@ -1173,25 +1325,11 @@ PRODUCT_FEATURE_KEYWORDS = {
 
 def _tokenize(text: str) -> List[str]:
     return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 2]
-
-
 def _collect_products_mentioned(
     analysis: Dict[str, Any],
     rag_hit: Dict[str, Any],
     transcript_text: str = "",
 ) -> List[str]:
-    """Merge every product the model/RAG/transcript-regex identified into an
-    ordered, deduped list.
-
-    Order priority:
-      1. analysis["product_mentioned"] (primary, from GPT)
-      2. analysis["products_mentioned"] (GPT-supplied list, if any)
-      3. rag_hit["product"] (RAG top guess)
-      4. each entry from rag_hit["secondary_products"] (in their order)
-      5. each entry from rag_hit["all_product_scores"] (final fallback)
-      6. NEW: any Bajaj product names extracted directly from the transcript
-              text — covers products not present in the RAG index.
-    """
     seen: set = set()
     out: List[str] = []
 
@@ -1199,7 +1337,7 @@ def _collect_products_mentioned(
         if not name:
             return
         s = _safe_filename_label(str(name)).strip()
-        if not s or s.lower() == "none":
+        if not s or s.lower() in {"none", "unknown"}:
             return
         key = s.lower()
         if key in seen:
@@ -1207,19 +1345,71 @@ def _collect_products_mentioned(
         seen.add(key)
         out.append(s)
 
+    # 1. Explicit transcript names FIRST — highest confidence
+    for name in _extract_product_mentions_from_text(transcript_text or ""):
+        _add(name)
+    for name in (rag_hit or {}).get("explicitly_mentioned", []):
+        _add(name)
+
+    # 2. GPT's answer
     _add(analysis.get("product_mentioned"))
     for p in (analysis.get("products_mentioned") or []):
         _add(p)
+
+    # 3. RAG hits
     _add((rag_hit or {}).get("product"))
     for sec in ((rag_hit or {}).get("secondary_products") or []):
         _add(sec.get("product"))
     for name in ((rag_hit or {}).get("all_product_scores") or {}).keys():
         _add(name)
-    # NEW: transcript-extracted product names (e.g. "Bajaj Life Shield
-    # Insurance Plan" when only Goal Suraksha specs are uploaded to RAG).
-    for name in _extract_product_mentions_from_text(transcript_text or ""):
-        _add(name)
+
     return out
+
+# def _collect_products_mentioned(
+#     analysis: Dict[str, Any],
+#     rag_hit: Dict[str, Any],
+#     transcript_text: str = "",
+# ) -> List[str]:
+#     """Merge every product the model/RAG/transcript-regex identified into an
+#     ordered, deduped list.
+
+#     Order priority:
+#       1. analysis["product_mentioned"] (primary, from GPT)
+#       2. analysis["products_mentioned"] (GPT-supplied list, if any)
+#       3. rag_hit["product"] (RAG top guess)
+#       4. each entry from rag_hit["secondary_products"] (in their order)
+#       5. each entry from rag_hit["all_product_scores"] (final fallback)
+#       6. NEW: any Bajaj product names extracted directly from the transcript
+#               text — covers products not present in the RAG index.
+#     """
+#     seen: set = set()
+#     out: List[str] = []
+
+#     def _add(name: Any):
+#         if not name:
+#             return
+#         s = _safe_filename_label(str(name)).strip()
+#         if not s or s.lower() == "none":
+#             return
+#         key = s.lower()
+#         if key in seen:
+#             return
+#         seen.add(key)
+#         out.append(s)
+
+#     _add(analysis.get("product_mentioned"))
+#     for p in (analysis.get("products_mentioned") or []):
+#         _add(p)
+#     _add((rag_hit or {}).get("product"))
+#     for sec in ((rag_hit or {}).get("secondary_products") or []):
+#         _add(sec.get("product"))
+#     for name in ((rag_hit or {}).get("all_product_scores") or {}).keys():
+#         _add(name)
+#     # NEW: transcript-extracted product names (e.g. "Bajaj Life Shield
+#     # Insurance Plan" when only Goal Suraksha specs are uploaded to RAG).
+#     for name in _extract_product_mentions_from_text(transcript_text or ""):
+#         _add(name)
+#     return out
 
 
 def _sentence_snippets(text: str, limit: int = 4) -> List[str]:
@@ -1756,19 +1946,140 @@ def search_product_rag(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     return ranked
 
 
+# def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any]:
+#     """Infer the likely product and retrieve supporting chunks from the transcript itself."""
+#     query = re.sub(r"\s+", " ", transcript_text or "").strip()
+#     if not query:
+#         return {"product": "None", "context": "", "chunks": []}
+
+#     # Check cache first
+#     cache_key = f"product_context:{hashlib.md5(query.encode()).hexdigest()}"
+#     cached = get_cache(cache_key)
+#     if cached is not None:
+#         return cached
+
+#     rows = search_product_rag(query, top_k=max(top_k, 8))
+#     meta_rows = _load_rag_meta()
+#     catalog = _build_product_catalog(meta_rows) if meta_rows else []
+
+#     if not rows and not catalog:
+#         result = {"product": "None", "context": "", "chunks": []}
+#         set_cache(cache_key, result)
+#         return result
+
+#     transcript_tokens = set(_tokenize(query))
+#     product_scores = defaultdict(float)
+#     product_evidence = defaultdict(list)
+#     product_matches = defaultdict(set)
+
+#     for rank, row in enumerate(rows):
+#         product = row.get("product", "Unknown")
+#         score = float(row.get("score", 0.0))
+#         product_scores[product] += max(score, 0.0) + (0.05 * (len(rows) - rank))
+#         product_evidence[product].append(row)
+
+#     for profile in catalog:
+#         product = profile["product"]
+#         top_terms = set(profile.get("top_terms", []))
+#         overlap = transcript_tokens.intersection(top_terms)
+#         if overlap:
+#             product_scores[product] += 0.12 * len(overlap)
+#             product_matches[product].update(sorted(overlap))
+
+#         for feature, keywords in PRODUCT_FEATURE_KEYWORDS.items():
+#             if any(keyword in query.lower() for keyword in keywords):
+#                 if feature in profile.get("feature_hits", {}):
+#                     product_scores[product] += 0.35 + 0.05 * float(profile.get("feature_hits", {}).get(feature, 0))
+#                     product_matches[product].add(feature)
+
+#     if not product_scores:
+#         result = {"product": "None", "context": "", "chunks": []}
+#         set_cache(cache_key, result)
+#         return result
+
+#     best_product, best_score = max(product_scores.items(), key=lambda item: item[1])
+#     best_profile = next((p for p in catalog if p["product"] == best_product), {})
+#     supporting_rows = sorted(product_evidence.get(best_product, []), key=lambda row: row.get("score", 0.0), reverse=True)[:top_k]
+#     context_lines = []
+#     for row in supporting_rows:
+#         context_lines.append(
+#             f"[{row.get('product', 'Unknown')} | {row.get('source', 'spec')} | chunk {row.get('chunk_index', 0)}] {row.get('text', '')}"
+#         )
+
+#     if best_profile:
+#         context_lines.append(
+#             f"[PROFILE | {best_profile.get('product', 'Unknown')}] Summary: {best_profile.get('summary', '')}\n"
+#             f"Feature anchors: {', '.join(sorted(best_profile.get('feature_hits', {}).keys())[:8]) or 'None'}"
+#         )
+
+#     evidence_terms = sorted(product_matches.get(best_product, set()))[:12]
+#     confidence = round(float(best_score), 3)
+#     product_confidence = min(0.99, 0.4 + confidence / 4.0)
+
+#     # ------------------------------------------------------------------
+#     # Multi-product detection: if more than one product scored close to the top,
+#     # surface them all so downstream checks compare against the correct spec
+#     # rather than only the single highest match.
+#     # ------------------------------------------------------------------
+#     secondary_products: List[Dict[str, Any]] = []
+#     threshold_score = best_score * 0.55  # within 55% of the top score
+#     transcript_lower = (query or "").lower()
+#     for prod, score in product_scores.items():
+#         if prod == best_product:
+#             continue
+#         # Surface a secondary product if EITHER it scores close to the top
+#         # OR its label appears in the transcript verbatim (explicit mention).
+#         explicit_mention = bool(prod) and prod.lower() in transcript_lower
+#         if score >= threshold_score or explicit_mention:
+#             sec_profile = next((p for p in catalog if p["product"] == prod), {})
+#             sec_rows = sorted(
+#                 product_evidence.get(prod, []),
+#                 key=lambda r: r.get("score", 0.0),
+#                 reverse=True,
+#             )[:max(2, top_k // 2)]
+#             secondary_products.append({
+#                 "product": prod,
+#                 "score": round(float(score), 3),
+#                 "explicit_mention": explicit_mention,
+#                 "evidence": sec_rows,
+#                 "profile": sec_profile,
+#             })
+#             # Append a context section so the LLM sees both specs
+#             for row in sec_rows:
+#                 context_lines.append(
+#                     f"[SECONDARY | {row.get('product', 'Unknown')} | {row.get('source', 'spec')} | chunk {row.get('chunk_index', 0)}] {row.get('text', '')}"
+#                 )
+
+#     secondary_products.sort(key=lambda x: (-int(x["explicit_mention"]), -x["score"]))
+#     secondary_products = secondary_products[:3]
+
+#     # Lower threshold from 0.15 to 0.08 for better product detection
+#     result = {
+#         "product": best_product if best_score > 0.08 else "None",
+#         "confidence": round(product_confidence, 3),
+#         "matched_terms": evidence_terms,
+#         "catalog": catalog[:6],
+#         "evidence": supporting_rows,
+#         "context": "\n\n".join(context_lines),
+#         "chunks": supporting_rows,
+#         "profile": best_profile,
+#         "secondary_products": secondary_products,
+#         "all_product_scores": {p: round(float(s), 3) for p, s in sorted(product_scores.items(), key=lambda x: -x[1])[:6]},
+#     }
+#     set_cache(cache_key, result)
+#     return result
+
 def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any]:
-    """Infer the likely product and retrieve supporting chunks from the transcript itself."""
     query = re.sub(r"\s+", " ", transcript_text or "").strip()
     if not query:
         return {"product": "None", "context": "", "chunks": []}
 
-    # Check cache first
     cache_key = f"product_context:{hashlib.md5(query.encode()).hexdigest()}"
     cached = get_cache(cache_key)
     if cached is not None:
         return cached
 
-    rows = search_product_rag(query, top_k=max(top_k, 8))
+    rows = search_product_rag(query, top_k=max(top_k, 12))
     meta_rows = _load_rag_meta()
     catalog = _build_product_catalog(meta_rows) if meta_rows else []
 
@@ -1777,11 +2088,13 @@ def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any
         set_cache(cache_key, result)
         return result
 
+    transcript_lower = query.lower()
     transcript_tokens = set(_tokenize(query))
-    product_scores = defaultdict(float)
-    product_evidence = defaultdict(list)
-    product_matches = defaultdict(set)
+    product_scores: Dict[str, float] = defaultdict(float)
+    product_evidence: Dict[str, list] = defaultdict(list)
+    product_matches: Dict[str, set] = defaultdict(set)
 
+    # Step 1: RAG similarity scores (unchanged)
     for rank, row in enumerate(rows):
         product = row.get("product", "Unknown")
         score = float(row.get("score", 0.0))
@@ -1795,90 +2108,133 @@ def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any
         if overlap:
             product_scores[product] += 0.12 * len(overlap)
             product_matches[product].update(sorted(overlap))
-
         for feature, keywords in PRODUCT_FEATURE_KEYWORDS.items():
             if any(keyword in query.lower() for keyword in keywords):
                 if feature in profile.get("feature_hits", {}):
-                    product_scores[product] += 0.35 + 0.05 * float(profile.get("feature_hits", {}).get(feature, 0))
+                    product_scores[product] += 0.35 + 0.05 * float(
+                        profile.get("feature_hits", {}).get(feature, 0))
                     product_matches[product].add(feature)
+
+    # ── Step 2: EXPLICIT NAME BOOST ──────────────────────────────────────────
+    EXPLICIT_MENTION_BONUS = 50.0  # always beats RAG similarity
+
+    def _normalise(s: str) -> str:
+        s = re.sub(r"(?i)\bbajaj\s+allianz\s+life\b", "bajaj life", s)
+        return re.sub(r"\s+", " ", s.lower()).strip()
+
+    name_to_product: Dict[str, str] = {}
+    for profile in catalog:
+        prod = profile["product"]
+        norm = _normalise(prod)
+        name_to_product[norm] = prod
+        # Short alias: "eTouch2" without the brand prefix
+        short = re.sub(r"^bajaj\s+(?:allianz\s+)?(?:life\s+)?", "", norm).strip()
+        if short and short != norm:
+            name_to_product[short] = prod
+
+    explicitly_mentioned: set = set()
+
+    for norm_name, prod in name_to_product.items():
+        if norm_name and norm_name in transcript_lower:
+            product_scores[prod] += EXPLICIT_MENTION_BONUS
+            product_matches[prod].add("explicit_name_mention")
+            explicitly_mentioned.add(prod)
+            log.info(f"[RAG] Explicit mention boost: '{prod}' (+{EXPLICIT_MENTION_BONUS})")
+
+    # Also catch names found by the transcript regex extractor
+    for tm in _extract_product_mentions_from_text(transcript_text or ""):
+        tm_norm = _normalise(tm)
+        matched = next(
+            (prod for norm, prod in name_to_product.items()
+             if norm in tm_norm or tm_norm in norm),
+            None,
+        )
+        if matched:
+            product_scores[matched] += EXPLICIT_MENTION_BONUS
+            explicitly_mentioned.add(matched)
 
     if not product_scores:
         result = {"product": "None", "context": "", "chunks": []}
         set_cache(cache_key, result)
         return result
 
-    best_product, best_score = max(product_scores.items(), key=lambda item: item[1])
+    # Step 3: rank
+    best_product, best_score = max(product_scores.items(), key=lambda x: x[1])
     best_profile = next((p for p in catalog if p["product"] == best_product), {})
-    supporting_rows = sorted(product_evidence.get(best_product, []), key=lambda row: row.get("score", 0.0), reverse=True)[:top_k]
+    supporting_rows = sorted(
+        product_evidence.get(best_product, []),
+        key=lambda r: r.get("score", 0.0), reverse=True
+    )[:top_k]
+
     context_lines = []
     for row in supporting_rows:
         context_lines.append(
-            f"[{row.get('product', 'Unknown')} | {row.get('source', 'spec')} | chunk {row.get('chunk_index', 0)}] {row.get('text', '')}"
+            f"[{row.get('product','Unknown')} | {row.get('source','spec')} "
+            f"| chunk {row.get('chunk_index',0)}] {row.get('text','')}"
         )
-
     if best_profile:
         context_lines.append(
-            f"[PROFILE | {best_profile.get('product', 'Unknown')}] Summary: {best_profile.get('summary', '')}\n"
-            f"Feature anchors: {', '.join(sorted(best_profile.get('feature_hits', {}).keys())[:8]) or 'None'}"
+            f"[PROFILE | {best_profile.get('product','Unknown')}] "
+            f"Summary: {best_profile.get('summary','')}\n"
+            f"Feature anchors: "
+            f"{', '.join(sorted(best_profile.get('feature_hits',{}).keys())[:8]) or 'None'}"
         )
 
-    evidence_terms = sorted(product_matches.get(best_product, set()))[:12]
-    confidence = round(float(best_score), 3)
-    product_confidence = min(0.99, 0.4 + confidence / 4.0)
-
-    # ------------------------------------------------------------------
-    # Multi-product detection: if more than one product scored close to the top,
-    # surface them all so downstream checks compare against the correct spec
-    # rather than only the single highest match.
-    # ------------------------------------------------------------------
+    # Step 4: multi-product — explicitly mentioned products are ALWAYS included
     secondary_products: List[Dict[str, Any]] = []
-    threshold_score = best_score * 0.55  # within 55% of the top score
-    transcript_lower = (query or "").lower()
     for prod, score in product_scores.items():
         if prod == best_product:
             continue
-        # Surface a secondary product if EITHER it scores close to the top
-        # OR its label appears in the transcript verbatim (explicit mention).
-        explicit_mention = bool(prod) and prod.lower() in transcript_lower
-        if score >= threshold_score or explicit_mention:
-            sec_profile = next((p for p in catalog if p["product"] == prod), {})
-            sec_rows = sorted(
-                product_evidence.get(prod, []),
-                key=lambda r: r.get("score", 0.0),
-                reverse=True,
-            )[:max(2, top_k // 2)]
-            secondary_products.append({
-                "product": prod,
-                "score": round(float(score), 3),
-                "explicit_mention": explicit_mention,
-                "evidence": sec_rows,
-                "profile": sec_profile,
-            })
-            # Append a context section so the LLM sees both specs
-            for row in sec_rows:
-                context_lines.append(
-                    f"[SECONDARY | {row.get('product', 'Unknown')} | {row.get('source', 'spec')} | chunk {row.get('chunk_index', 0)}] {row.get('text', '')}"
-                )
+        is_explicit = prod in explicitly_mentioned
+        is_close    = score >= best_score * 0.55
+        if not (is_explicit or is_close):
+            continue
+        sec_profile = next((p for p in catalog if p["product"] == prod), {})
+        sec_rows = sorted(
+            product_evidence.get(prod, []),
+            key=lambda r: r.get("score", 0.0), reverse=True
+        )[:max(2, top_k // 2)]
+        secondary_products.append({
+            "product": prod,
+            "score": round(float(score), 3),
+            "explicit_mention": is_explicit,
+            "evidence": sec_rows,
+            "profile": sec_profile,
+        })
+        for row in sec_rows:
+            context_lines.append(
+                f"[SECONDARY | {row.get('product','Unknown')} | "
+                f"{row.get('source','spec')} | chunk {row.get('chunk_index',0)}] "
+                f"{row.get('text','')}"
+            )
 
     secondary_products.sort(key=lambda x: (-int(x["explicit_mention"]), -x["score"]))
-    secondary_products = secondary_products[:3]
+    secondary_products = secondary_products[:5]
 
-    # Lower threshold from 0.15 to 0.08 for better product detection
+    evidence_terms = sorted(product_matches.get(best_product, set()))[:12]
+    confidence = round(float(best_score), 3)
+    product_confidence = min(0.99, 0.4 + confidence / (EXPLICIT_MENTION_BONUS + 4.0))
+    if best_product in explicitly_mentioned:
+        product_confidence = min(0.99, product_confidence + 0.45)
+
     result = {
         "product": best_product if best_score > 0.08 else "None",
         "confidence": round(product_confidence, 3),
         "matched_terms": evidence_terms,
-        "catalog": catalog[:6],
+        "explicitly_mentioned": list(explicitly_mentioned),
+        "catalog": catalog[:8],
         "evidence": supporting_rows,
         "context": "\n\n".join(context_lines),
         "chunks": supporting_rows,
         "profile": best_profile,
         "secondary_products": secondary_products,
-        "all_product_scores": {p: round(float(s), 3) for p, s in sorted(product_scores.items(), key=lambda x: -x[1])[:6]},
+        "all_product_scores": {
+            p: round(float(s), 3)
+            for p, s in sorted(product_scores.items(), key=lambda x: -x[1])[:8]
+        },
     }
     set_cache(cache_key, result)
     return result
-
 
 def query_product_rag(product_name: str, question: str) -> str:
     query = " ".join(part for part in [product_name, question] if part).strip()
@@ -2125,6 +2481,18 @@ PRODUCT CHECK VERDICT RULES — READ CAREFULLY (these matter for false-positive 
 - DO NOT label as "fail" because the spec says things like "verify from system" / "refer to policy bond" / "as per records" — those are meta-instructions, not contradicting facts.
 - DO NOT label as "fail" because the spec is silent on the topic — that is "risk" at most.
 - DO NOT label as "fail" because the bot quoted a number with no matching number in the spec — the bot may have read from the customer's policy in CRM.
+CRITICAL MULTI-PRODUCT AND SPEC-MATCHING RULES:
+- A single call can involve MORE THAN ONE product (e.g. eTouch AND Goal Suraksha).
+  Identify ALL products explicitly named in the transcript.
+- For EACH identified product, run separate product checks using ONLY that product's spec.
+  NEVER check a statement about Product A against the spec of Product B.
+- Set the "product" field on every product_check entry to identify which product it belongs to.
+- If the transcript explicitly states a product name (e.g. "Bajaj Life eTouch2"), that IS the
+  product_mentioned regardless of what the RAG context scores suggest.
+- If no spec is available in the context for a mentioned product, omit checks for it rather
+  than substituting another product's spec.
+- The "product_mentioned" field must reflect what the customer/bot explicitly said,
+  not what the RAG context ranked highest.
 
 MULTI-PRODUCT HANDLING:
 - If the transcript mentions or strongly implies MORE THAN ONE product, identify ALL of them.
@@ -2184,7 +2552,7 @@ OUTPUT FORMAT — respond with ONLY this JSON structure:
   "flags": [<array of flag strings: only actual compliance_breach, false_information, regulatory_violation, or behavior_issue if they occurred; empty array if no violations>],
   "sentiment": "<positive|neutral|frustrated|angry|distressed>",
   "product_mentioned": "<primary product name or 'None'>",
-  "products_mentioned": [<full list of every product mentioned/implied in the call; empty array if none>],
+  "products_mentioned": [<ALL products explicitly named in the transcript, in order of first mention>; empty array if none>],
     "product_confidence": <0-1 float>,
     "product_signals": ["keywords or product details that drove the match"],
   "product_accuracy_score": <1-5 or null>,
@@ -2235,9 +2603,10 @@ Ensure param_comments contains exactly 10 entries in score order and each entry 
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg}
             ],
-            temperature=0.1,
+            temperature=0.0,
             response_format={"type": "json_object"}
         )
+        log_api_usage(OPENAI_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens)
         raw = response.choices[0].message.content
         return json.loads(raw)
     except openai.AuthenticationError:
@@ -2316,31 +2685,44 @@ def _mock_analysis(turns: List[Dict]) -> Dict:
 
 # ── Processing Pipeline ──────────────────────────────────────────────────────
 async def process_realtime_call(job_id: str, item: dict):
-    """Process a single real-time call item (already parsed)."""
-    db = load_db()
-    job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-    if job_idx is None:
-        return
-    db["jobs"][job_idx]["status"] = "processing"
-    save_db(db)
-
+    update_job(job_id, status="processing")
+ 
     try:
-        # Use pre-parsed turns if available, otherwise parse from text
         turns = item.get("turns") or parse_transcript_text(item["text"])
-        meta = item.get("meta", {})
-
+        meta  = item.get("meta", {})
+        call_id = str(uuid.uuid4())
+ 
+        # Store raw transcript immediately (Table 1)
+        insert_raw_call(call_id, job_id, item)
+ 
         rag_hit = infer_product_context(item["text"])
         product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
         detected_product = rag_hit.get("product", "None")
         if detected_product and detected_product != "None":
             product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
-
+ 
         analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
-
-        # Fill product context fields so policy rules & best-spec lookup work correctly
-        if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
-            analysis["product_mentioned"] = detected_product
-        analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
+ 
+        explicitly_mentioned_set = set(
+            _safe_filename_label(p)
+            for p in (rag_hit.get("explicitly_mentioned") or [])
+        ) | set(
+            _safe_filename_label(p)
+            for p in _extract_product_mentions_from_text(item["text"] or "")
+        )
+        gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
+        if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+            analysis["product_mentioned"] = gpt_product
+        elif explicitly_mentioned_set:
+            analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
+        else:
+            rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+            if rag_product and rag_product.lower() not in {"none", "unknown"} \
+                    and rag_product.lower() in (item["text"] or "").lower():
+                analysis["product_mentioned"] = rag_product
+            else:
+                analysis["product_mentioned"] = "None"
+ 
         analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
         analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
         analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
@@ -2349,38 +2731,33 @@ async def process_realtime_call(job_id: str, item: dict):
         analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
         analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
         analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
-
-        # Sentiment refinement + QA safety-net rules (same as batch path)
         analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
         if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
             analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
         analysis = _apply_qa_policy_rules(analysis, turns)
         analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
-
-        # --- Overlay voicebot metadata where available ---
-        if meta.get("intent"):
-            analysis["voicebot_intent"] = meta["intent"]
-        if meta.get("summary") and meta["summary"].strip():
-            analysis["summary"] = meta["summary"].strip()
-        if meta.get("no_of_queries") is not None:
-            analysis["no_of_queries"] = meta["no_of_queries"]
-        if meta.get("no_of_queries_resolved") is not None:
-            analysis["no_of_queries_resolved"] = meta["no_of_queries_resolved"]
-        if meta.get("customer_journey"):
-            analysis["customer_journey"] = meta["customer_journey"]
+        # Always recompute score server-side
+        analysis["weighted_score"] = _compute_weighted_score(analysis.get("scores", {}))
+ 
+        # Overlay voicebot metadata
+        if meta.get("intent"):         analysis["voicebot_intent"] = meta["intent"]
+        if meta.get("summary","").strip(): analysis["summary"] = meta["summary"].strip()
+        if meta.get("no_of_queries") is not None:          analysis["no_of_queries"] = meta["no_of_queries"]
+        if meta.get("no_of_queries_resolved") is not None: analysis["no_of_queries_resolved"] = meta["no_of_queries_resolved"]
+        if meta.get("customer_journey"): analysis["customer_journey"] = meta["customer_journey"]
         if meta.get("standalone_type"):
-            # Use voicebot's standalone_type as category if available
-            analysis["category"] = meta["standalone_type"][0] if meta["standalone_type"] else analysis.get("category", "General Query")
+            analysis["category"] = meta["standalone_type"][0] if meta["standalone_type"] else analysis.get("category","General Query")
             analysis["standalone_type"] = meta["standalone_type"]
-        if meta.get("sub_query_type"):
-            analysis["sub_query_type"] = meta["sub_query_type"]
-        if meta.get("call_comp_flag"):
-            analysis["call_comp_flag"] = meta["call_comp_flag"]
-        if meta.get("audio_link"):
-            analysis["audio_link"] = meta["audio_link"]
-            
+        if meta.get("sub_query_type"): analysis["sub_query_type"] = meta["sub_query_type"]
+        if meta.get("call_comp_flag"): analysis["call_comp_flag"] = meta["call_comp_flag"]
+        if meta.get("audio_link"):     analysis["audio_link"] = meta["audio_link"]
+ 
+        # ── Derive fatal/flagged deterministically ────────────────────────────
+        is_fatal   = analysis.get("severity") in {"fatal", "critical"}
+        is_flagged = len(analysis.get("flags", [])) > 0
+ 
         call_record = {
-            "id": str(uuid.uuid4()),
+            "id": call_id,
             "job_id": job_id,
             "name": item["name"],
             "sl": item.get("sl", ""),
@@ -2389,36 +2766,393 @@ async def process_realtime_call(job_id: str, item: dict):
             "raw_text": item["text"][:5000],
             "analysis": analysis,
             "processed_at": datetime.now().isoformat(),
-            "flagged": len(analysis.get("flags", [])) > 0,
-            "fatal": analysis.get("severity") == "fatal"
+            "flagged": is_flagged,
+            "fatal":   is_fatal,
         }
-
-        db = load_db()
-        db["calls"].append(call_record)
-        job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-        if job_idx is not None:
-            db["jobs"][job_idx]["processed"] = 1
-            db["jobs"][job_idx]["status"] = "completed"
-            db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-            db["jobs"][job_idx]["fatal_count"] = 1 if call_record["fatal"] else 0
-            db["jobs"][job_idx]["flag_count"] = 1 if call_record["flagged"] else 0
-        save_db(db)
-
+ 
+        # Store analysis result (Table 2)
+        upsert_analyzed_call(call_record)
+ 
+        update_job(job_id,
+                   status="completed",
+                   processed=1,
+                   fatal_count=1 if is_fatal else 0,
+                   flag_count=1 if is_flagged else 0,
+                   completed_at=datetime.now().isoformat())
+ 
     except Exception as e:
         log.error(f"Realtime call processing error: {e}")
-        db = load_db()
-        job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-        if job_idx is not None:
-            db["jobs"][job_idx]["status"] = "completed"
-            db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-        save_db(db)
+        update_job(job_id, status="completed", completed_at=datetime.now().isoformat())
+ 
+# async def process_realtime_call(job_id: str, item: dict):
+#     """Process a single real-time call item (already parsed)."""
+#     db = load_db()
+#     job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#     if job_idx is None:
+#         return
+#     db["jobs"][job_idx]["status"] = "processing"
+#     save_db(db)
 
+#     try:
+#         # Use pre-parsed turns if available, otherwise parse from text
+#         turns = item.get("turns") or parse_transcript_text(item["text"])
+#         meta = item.get("meta", {})
+
+#         rag_hit = infer_product_context(item["text"])
+#         product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
+#         detected_product = rag_hit.get("product", "None")
+#         if detected_product and detected_product != "None":
+#             product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
+
+#         analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
+#         analysis["weighted_score"] = _compute_weighted_score(analysis.get("scores", {}))
+
+
+#         # Fill product context fields so policy rules & best-spec lookup work correctly
+#         # if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
+#         #     analysis["product_mentioned"] = detected_product
+#         # analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
+#         # analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
+#         # AFTER — paste this in both process_realtime_call and process_job:
+#         explicitly_mentioned_set = set(
+#             _safe_filename_label(p)
+#             for p in (rag_hit.get("explicitly_mentioned") or [])
+#         ) | set(
+#             _safe_filename_label(p)
+#             for p in _extract_product_mentions_from_text(item["text"] or "")
+#         )
+
+#         gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
+
+#         if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+#             # GPT named something — trust it
+#             analysis["product_mentioned"] = gpt_product
+#         elif explicitly_mentioned_set:
+#             # GPT said None but transcript clearly names a product we have a spec for
+#             analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
+#         else:
+#             # Last resort: use RAG best guess only if it literally appears in the transcript
+#             rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+#             if rag_product and rag_product.lower() not in {"none", "unknown"} \
+#                     and rag_product.lower() in (item["text"] or "").lower():
+#                 analysis["product_mentioned"] = rag_product
+#             else:
+#                 analysis["product_mentioned"] = "None"
+
+#         analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
+#         analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
+#         analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
+#         analysis.setdefault("product_checks", [])
+#         analysis.setdefault("product_profile", rag_hit.get("profile", {}))
+#         analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
+#         analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
+#         analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
+
+#         # Sentiment refinement + QA safety-net rules (same as batch path)
+#         analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
+#         if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
+#             analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
+#         analysis = _apply_qa_policy_rules(analysis, turns)
+#         analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
+
+#         # --- Overlay voicebot metadata where available ---
+#         if meta.get("intent"):
+#             analysis["voicebot_intent"] = meta["intent"]
+#         if meta.get("summary") and meta["summary"].strip():
+#             analysis["summary"] = meta["summary"].strip()
+#         if meta.get("no_of_queries") is not None:
+#             analysis["no_of_queries"] = meta["no_of_queries"]
+#         if meta.get("no_of_queries_resolved") is not None:
+#             analysis["no_of_queries_resolved"] = meta["no_of_queries_resolved"]
+#         if meta.get("customer_journey"):
+#             analysis["customer_journey"] = meta["customer_journey"]
+#         if meta.get("standalone_type"):
+#             # Use voicebot's standalone_type as category if available
+#             analysis["category"] = meta["standalone_type"][0] if meta["standalone_type"] else analysis.get("category", "General Query")
+#             analysis["standalone_type"] = meta["standalone_type"]
+#         if meta.get("sub_query_type"):
+#             analysis["sub_query_type"] = meta["sub_query_type"]
+#         if meta.get("call_comp_flag"):
+#             analysis["call_comp_flag"] = meta["call_comp_flag"]
+#         if meta.get("audio_link"):
+#             analysis["audio_link"] = meta["audio_link"]
+            
+#         call_record = {
+#             "id": str(uuid.uuid4()),
+#             "job_id": job_id,
+#             "name": item["name"],
+#             "sl": item.get("sl", ""),
+#             "source_file": "realtime",
+#             "transcript": turns,
+#             "raw_text": item["text"][:5000],
+#             "analysis": analysis,
+#             "processed_at": datetime.now().isoformat(),
+#             "flagged": len(analysis.get("flags", [])) > 0,
+#             "fatal": analysis.get("severity") == "fatal"
+#         }
+
+#         db = load_db()
+#         db["calls"].append(call_record)
+#         job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#         if job_idx is not None:
+#             db["jobs"][job_idx]["processed"] = 1
+#             db["jobs"][job_idx]["status"] = "completed"
+#             db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
+#             db["jobs"][job_idx]["fatal_count"] = 1 if call_record["fatal"] else 0
+#             db["jobs"][job_idx]["flag_count"] = 1 if call_record["flagged"] else 0
+#         save_db(db)
+
+#     except Exception as e:
+#         log.error(f"Realtime call processing error: {e}")
+#         db = load_db()
+#         job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#         if job_idx is not None:
+#             db["jobs"][job_idx]["status"] = "completed"
+#             db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
+#         save_db(db)
+
+# async def process_job(job_id: str, file_paths: List[Path]):
+#     db = load_db()
+#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+#     if not job:
+#         return
+    
+#     all_transcripts = []
+#     for fp in file_paths:
+#         try:
+#             items = extract_transcripts_from_file(fp)
+#             all_transcripts.extend(items)
+#         except Exception as e:
+#             log.error(f"File parse error {fp}: {e}")
+    
+#     job["total"] = len(all_transcripts)
+#     job["status"] = "processing"
+#     job["processed"] = 0
+#     save_db(db)
+    
+#     for item in all_transcripts:
+#         try:
+#             turns = parse_transcript_text(item["text"])
+
+#             # RAG product lookup from the transcript itself, even if the product name is not mentioned.
+#             rag_hit = infer_product_context(item["text"])
+#             product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
+#             detected_product = rag_hit.get("product", "None")
+#             if detected_product and detected_product != "None":
+#                 product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
+
+#             analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
+#             # analysis.setdefault("product_mentioned", detected_product)
+#             # if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
+#             #     analysis["product_mentioned"] = detected_product
+#             # analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
+#             # analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
+            
+#             # AFTER — paste this in both process_realtime_call and process_job:
+#             explicitly_mentioned_set = set(
+#                 _safe_filename_label(p)
+#                 for p in (rag_hit.get("explicitly_mentioned") or [])
+#             ) | set(
+#                 _safe_filename_label(p)
+#                 for p in _extract_product_mentions_from_text(item["text"] or "")
+#             )
+
+#             gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
+
+#             if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+#                 # GPT named something — trust it
+#                 analysis["product_mentioned"] = gpt_product
+#             elif explicitly_mentioned_set:
+#                 # GPT said None but transcript clearly names a product we have a spec for
+#                 analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
+#             else:
+#                 # Last resort: use RAG best guess only if it literally appears in the transcript
+#                 rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+#                 if rag_product and rag_product.lower() not in {"none", "unknown"} \
+#                         and rag_product.lower() in (item["text"] or "").lower():
+#                     analysis["product_mentioned"] = rag_product
+#                 else:
+#                     analysis["product_mentioned"] = "None"
+
+#             analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
+#             analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
+#             analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
+#             analysis.setdefault("product_checks", [])
+#             analysis.setdefault("product_profile", rag_hit.get("profile", {}))
+#             analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
+#             analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
+#             analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
+#             analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
+#             if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
+#                 analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
+#             analysis = _apply_qa_policy_rules(analysis, turns)
+#             analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
+            
+#             call_record = {
+#                 "id": str(uuid.uuid4()),
+#                 "job_id": job_id,
+#                 "name": item["name"],
+#                 "sl": item.get("sl", ""),
+#                 "source_file": item.get("source_file", ""),
+#                 "transcript": turns if turns else [{"sl":1,"speaker":"unknown","text":item["text"][:2000]}],
+#                 "raw_text": item["text"][:5000],
+#                 "analysis": analysis,
+#                 "processed_at": datetime.now().isoformat(),
+#                 "flagged": len(analysis.get("flags", [])) > 0,
+#                 "fatal": analysis.get("severity") == "fatal"
+#             }
+            
+#             db = load_db()
+#             db["calls"].append(call_record)
+#             job_idx = next((i for i,j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#             if job_idx is not None:
+#                 db["jobs"][job_idx]["processed"] = db["jobs"][job_idx].get("processed", 0) + 1
+#                 db["jobs"][job_idx]["fatal_count"] = db["jobs"][job_idx].get("fatal_count", 0) + (1 if call_record["fatal"] else 0)
+#                 db["jobs"][job_idx]["flag_count"] = db["jobs"][job_idx].get("flag_count", 0) + (1 if call_record["flagged"] else 0)
+#             save_db(db)
+            
+#         except Exception as e:
+#             log.error(f"Call processing error: {e}")
+    
+#     db = load_db()
+#     job_idx = next((i for i,j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#     if job_idx is not None:
+#         db["jobs"][job_idx]["status"] = "completed"
+#         db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
+#     save_db(db)
+# async def process_job(job_id: str, file_paths: List[Path]):
+#     db = load_db()
+#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+#     if not job:
+#         return
+
+#     all_transcripts = []
+#     for fp in file_paths:
+#         try:
+#             items = extract_transcripts_from_file(fp)
+#             all_transcripts.extend(items)
+#         except Exception as e:
+#             log.error(f"File parse error {fp}: {e}")
+
+#     job["total"] = len(all_transcripts)
+#     job["status"] = "processing"
+#     job["processed"] = 0
+#     save_db(db)
+
+#     for item in all_transcripts:
+
+#         # ── Signal check BEFORE each GPT call ────────────────────────────────
+#         signal = check_job_signal(job_id)
+
+#         if signal == "cancel":
+#             clear_job_signal(job_id)
+#             db = load_db()
+#             job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#             if job_idx is not None:
+#                 db["jobs"][job_idx]["status"] = "cancelled"
+#                 db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
+#             save_db(db)
+#             log.info(f"Job {job_id} cancelled")
+#             return   # exits the entire function immediately
+
+#         if signal == "pause":
+#             clear_job_signal(job_id)
+#             db = load_db()
+#             job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#             if job_idx is not None:
+#                 db["jobs"][job_idx]["status"] = "paused"
+#             save_db(db)
+#             log.info(f"Job {job_id} paused — waiting for resume")
+#             while True:
+#                 await asyncio.sleep(2)
+#                 wake = check_job_signal(job_id)
+#                 if wake == "cancel":
+#                     clear_job_signal(job_id)
+#                     db = load_db()
+#                     job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#                     if job_idx is not None:
+#                         db["jobs"][job_idx]["status"] = "cancelled"
+#                         db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
+#                     save_db(db)
+#                     return
+#                 if wake == "resume":
+#                     clear_job_signal(job_id)
+#                     db = load_db()
+#                     job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#                     if job_idx is not None:
+#                         db["jobs"][job_idx]["status"] = "processing"
+#                     save_db(db)
+#                     log.info(f"Job {job_id} resumed")
+#                     break
+#         # ── end signal check — now do the actual GPT work ────────────────────
+
+#         try:
+#             turns = parse_transcript_text(item["text"])
+#             rag_hit = infer_product_context(item["text"])
+#             product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
+#             detected_product = rag_hit.get("product", "None")
+#             if detected_product and detected_product != "None":
+#                 product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
+
+#             analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
+#             analysis["weighted_score"] = _compute_weighted_score(analysis.get("scores", {}))
+#             analysis.setdefault("product_mentioned", detected_product)
+#             if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
+#                 analysis["product_mentioned"] = detected_product
+#             analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
+#             analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
+#             analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
+#             analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
+#             analysis.setdefault("product_checks", [])
+#             analysis.setdefault("product_profile", rag_hit.get("profile", {}))
+#             analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
+#             analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
+#             analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
+#             analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
+#             if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
+#                 analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
+#             analysis = _apply_qa_policy_rules(analysis, turns)
+#             analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
+
+#             call_record = {
+#                 "id": str(uuid.uuid4()),
+#                 "job_id": job_id,
+#                 "name": item["name"],
+#                 "sl": item.get("sl", ""),
+#                 "source_file": item.get("source_file", ""),
+#                 "transcript": turns if turns else [{"sl": 1, "speaker": "unknown", "text": item["text"][:2000]}],
+#                 "raw_text": item["text"][:5000],
+#                 "analysis": analysis,
+#                 "processed_at": datetime.now().isoformat(),
+#                 "flagged": len(analysis.get("flags", [])) > 0,
+#                 "fatal": analysis.get("severity") == "fatal"
+#             }
+
+#             db = load_db()
+#             db["calls"].append(call_record)
+#             job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#             if job_idx is not None:
+#                 db["jobs"][job_idx]["processed"] = db["jobs"][job_idx].get("processed", 0) + 1
+#                 db["jobs"][job_idx]["fatal_count"] = db["jobs"][job_idx].get("fatal_count", 0) + (1 if call_record["fatal"] else 0)
+#                 db["jobs"][job_idx]["flag_count"] = db["jobs"][job_idx].get("flag_count", 0) + (1 if call_record["flagged"] else 0)
+#             save_db(db)
+
+#         except Exception as e:
+#             log.error(f"Call processing error: {e}")
+
+#     db = load_db()
+#     job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
+#     if job_idx is not None:
+#         # Only mark completed if not already cancelled
+#         if db["jobs"][job_idx].get("status") not in {"cancelled", "paused"}:
+#             db["jobs"][job_idx]["status"] = "completed"
+#             db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
+#     save_db(db)
 async def process_job(job_id: str, file_paths: List[Path]):
-    db = load_db()
-    job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+    job = get_job(job_id)
     if not job:
         return
-    
+ 
     all_transcripts = []
     for fp in file_paths:
         try:
@@ -2426,28 +3160,70 @@ async def process_job(job_id: str, file_paths: List[Path]):
             all_transcripts.extend(items)
         except Exception as e:
             log.error(f"File parse error {fp}: {e}")
-    
-    job["total"] = len(all_transcripts)
-    job["status"] = "processing"
-    job["processed"] = 0
-    save_db(db)
-    
+ 
+    update_job(job_id, total=len(all_transcripts), status="processing", processed=0)
+ 
     for item in all_transcripts:
+        signal = check_job_signal(job_id)
+ 
+        if signal == "cancel":
+            clear_job_signal(job_id)
+            update_job(job_id, status="cancelled", completed_at=datetime.now().isoformat())
+            log.info(f"Job {job_id} cancelled")
+            return
+ 
+        if signal == "pause":
+            clear_job_signal(job_id)
+            update_job(job_id, status="paused")
+            log.info(f"Job {job_id} paused")
+            while True:
+                await asyncio.sleep(2)
+                wake = check_job_signal(job_id)
+                if wake == "cancel":
+                    clear_job_signal(job_id)
+                    update_job(job_id, status="cancelled", completed_at=datetime.now().isoformat())
+                    return
+                if wake == "resume":
+                    clear_job_signal(job_id)
+                    update_job(job_id, status="processing")
+                    log.info(f"Job {job_id} resumed")
+                    break
+ 
         try:
-            turns = parse_transcript_text(item["text"])
-
-            # RAG product lookup from the transcript itself, even if the product name is not mentioned.
+            call_id = str(uuid.uuid4())
+            turns   = parse_transcript_text(item["text"])
+ 
+            # Store raw transcript (Table 1)
+            insert_raw_call(call_id, job_id, item)
+ 
             rag_hit = infer_product_context(item["text"])
             product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
             detected_product = rag_hit.get("product", "None")
             if detected_product and detected_product != "None":
                 product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
-
+ 
             analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
-            analysis.setdefault("product_mentioned", detected_product)
-            if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
-                analysis["product_mentioned"] = detected_product
-            analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
+ 
+            explicitly_mentioned_set = set(
+                _safe_filename_label(p)
+                for p in (rag_hit.get("explicitly_mentioned") or [])
+            ) | set(
+                _safe_filename_label(p)
+                for p in _extract_product_mentions_from_text(item["text"] or "")
+            )
+            gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
+            if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+                analysis["product_mentioned"] = gpt_product
+            elif explicitly_mentioned_set:
+                analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
+            else:
+                rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+                if rag_product and rag_product.lower() not in {"none", "unknown"} \
+                        and rag_product.lower() in (item["text"] or "").lower():
+                    analysis["product_mentioned"] = rag_product
+                else:
+                    analysis["product_mentioned"] = "None"
+ 
             analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
             analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
             analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
@@ -2461,9 +3237,15 @@ async def process_job(job_id: str, file_paths: List[Path]):
                 analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
             analysis = _apply_qa_policy_rules(analysis, turns)
             analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
-            
+            # Always recompute score server-side
+            analysis["weighted_score"] = _compute_weighted_score(analysis.get("scores", {}))
+ 
+            # ── Derive fatal/flagged deterministically ────────────────────────
+            is_fatal   = analysis.get("severity") in {"fatal", "critical"}
+            is_flagged = len(analysis.get("flags", [])) > 0
+ 
             call_record = {
-                "id": str(uuid.uuid4()),
+                "id": call_id,
                 "job_id": job_id,
                 "name": item["name"],
                 "sl": item.get("sl", ""),
@@ -2472,29 +3254,26 @@ async def process_job(job_id: str, file_paths: List[Path]):
                 "raw_text": item["text"][:5000],
                 "analysis": analysis,
                 "processed_at": datetime.now().isoformat(),
-                "flagged": len(analysis.get("flags", [])) > 0,
-                "fatal": analysis.get("severity") == "fatal"
+                "flagged": is_flagged,
+                "fatal":   is_fatal,
             }
-            
-            db = load_db()
-            db["calls"].append(call_record)
-            job_idx = next((i for i,j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-            if job_idx is not None:
-                db["jobs"][job_idx]["processed"] = db["jobs"][job_idx].get("processed", 0) + 1
-                db["jobs"][job_idx]["fatal_count"] = db["jobs"][job_idx].get("fatal_count", 0) + (1 if call_record["fatal"] else 0)
-                db["jobs"][job_idx]["flag_count"] = db["jobs"][job_idx].get("flag_count", 0) + (1 if call_record["flagged"] else 0)
-            save_db(db)
-            
+ 
+            # Store analysis result (Table 2)
+            upsert_analyzed_call(call_record)
+            increment_job_counters(
+                job_id,
+                processed=1,
+                fatal=1 if is_fatal else 0,
+                flagged=1 if is_flagged else 0,
+            )
+ 
         except Exception as e:
             log.error(f"Call processing error: {e}")
-    
-    db = load_db()
-    job_idx = next((i for i,j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-    if job_idx is not None:
-        db["jobs"][job_idx]["status"] = "completed"
-        db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-    save_db(db)
-
+ 
+    job_now = get_job(job_id)
+    if job_now and job_now.get("status") not in {"cancelled", "paused"}:
+        update_job(job_id, status="completed", completed_at=datetime.now().isoformat())
+ 
 # ── API Endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
@@ -2523,8 +3302,20 @@ async def upload_files(background_tasks: BackgroundTasks, files: List[UploadFile
         dest.write_bytes(content)
         saved_paths.append(dest)
     
-    db = load_db()
-    db["jobs"].append({
+    # db = load_db()
+    # db["jobs"].append({
+    #     "id": job_id,
+    #     "status": "queued",
+    #     "files": [f.filename for f in files],
+    #     "total": 0,
+    #     "processed": 0,
+    #     "fatal_count": 0,
+    #     "flag_count": 0,
+    #     "created_at": datetime.now().isoformat(),
+    #     "completed_at": None
+    # })
+    # save_db(db)
+    create_job({
         "id": job_id,
         "status": "queued",
         "files": [f.filename for f in files],
@@ -2533,9 +3324,8 @@ async def upload_files(background_tasks: BackgroundTasks, files: List[UploadFile
         "fatal_count": 0,
         "flag_count": 0,
         "created_at": datetime.now().isoformat(),
-        "completed_at": None
+        "completed_at": None,
     })
-    save_db(db)
     
     background_tasks.add_task(process_job, job_id, saved_paths)
     return {"job_id": job_id, "files_received": len(files), "status": "queued"}
@@ -2619,15 +3409,22 @@ async def ingest_realtime_call(request: Request, background_tasks: BackgroundTas
         if not item["turns"]:
             raise HTTPException(status_code=422, detail="conversation_log has no valid messages")
         job_id = str(uuid.uuid4())
-        db = load_db()
-        db["jobs"].append({
+        # db = load_db()
+        # db["jobs"].append({
+        #     "id": job_id, "status": "queued",
+        #     "files": [f"realtime:{item['name']}"],
+        #     "total": 1, "processed": 0,
+        #     "fatal_count": 0, "flag_count": 0,
+        #     "created_at": datetime.now().isoformat(), "completed_at": None,
+        # })
+        # save_db(db)
+        create_job({
             "id": job_id, "status": "queued",
             "files": [f"realtime:{item['name']}"],
             "total": 1, "processed": 0,
             "fatal_count": 0, "flag_count": 0,
             "created_at": datetime.now().isoformat(), "completed_at": None,
         })
-        save_db(db)
         background_tasks.add_task(process_realtime_call, job_id, item)
         return {"job_id": job_id, "call_id": item["name"], "status": "queued"}
 
@@ -2645,15 +3442,22 @@ async def ingest_realtime_call(request: Request, background_tasks: BackgroundTas
                 skipped.append({"call_id": item["name"], "reason": "no valid messages"})
                 continue
             job_id = str(uuid.uuid4())
-            db = load_db()
-            db["jobs"].append({
+            # db = load_db()
+            # db["jobs"].append({
+            #     "id": job_id, "status": "queued",
+            #     "files": [f"realtime:{item['name']}"],
+            #     "total": 1, "processed": 0,
+            #     "fatal_count": 0, "flag_count": 0,
+            #     "created_at": datetime.now().isoformat(), "completed_at": None,
+            # })
+            # save_db(db)
+            create_job({
                 "id": job_id, "status": "queued",
                 "files": [f"realtime:{item['name']}"],
                 "total": 1, "processed": 0,
                 "fatal_count": 0, "flag_count": 0,
                 "created_at": datetime.now().isoformat(), "completed_at": None,
             })
-            save_db(db)
             background_tasks.add_task(process_realtime_call, job_id, item)
             results.append({"job_id": job_id, "call_id": item["name"], "status": "queued"})
         return {
@@ -2727,19 +3531,116 @@ async def delete_all_product_specs():
     remove_all_product_specs()
     return {"message": "All product specs removed"}
 
+# @app.get("/api/jobs")
+# async def get_jobs():
+#     db = load_db()
+#     return db["jobs"]
+
+# @app.get("/api/jobs/{job_id}")
+# async def get_job(job_id: str):
+#     db = load_db()
+#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+#     if not job:
+#         raise HTTPException(404, "Job not found")
+#     return job
 @app.get("/api/jobs")
 async def get_jobs():
-    db = load_db()
-    return db["jobs"]
-
+    return list_jobs()
+ 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str):
-    db = load_db()
-    job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+async def get_job_endpoint(job_id: str):
+    job = get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     return job
 
+# @app.get("/api/calls")
+# async def get_calls(
+#     page: int = Query(1, ge=1),
+#     page_size: int = Query(50, ge=1, le=500),
+#     severity: Optional[str] = None,
+#     category: Optional[str] = None,
+#     sentiment: Optional[str] = None,
+#     pass_fail: Optional[str] = None,
+#     flagged: Optional[bool] = None,
+#     search: Optional[str] = None,
+#     job_id: Optional[str] = None,
+#     sort_by: str = "processed_at",
+#     sort_dir: str = "desc"
+# ):
+#     db = load_db()
+#     calls = db["calls"]
+    
+#     # Filters
+#     if severity:
+#         calls = [c for c in calls if c["analysis"].get("severity") == severity]
+#     if category:
+#         calls = [c for c in calls if c["analysis"].get("category") == category]
+#     if sentiment:
+#         calls = [c for c in calls if c["analysis"].get("sentiment") == sentiment]
+#     if pass_fail:
+#         calls = [c for c in calls if c["analysis"].get("pass_fail") == pass_fail]
+#     if flagged is not None:
+#         calls = [c for c in calls if c.get("flagged") == flagged]
+#     if job_id:
+#         calls = [c for c in calls if c.get("job_id") == job_id]
+#     if search:
+#         s = search.lower()
+#         calls = [c for c in calls if s in c["name"].lower() or s in c.get("raw_text","").lower()]
+    
+#     total = len(calls)
+    
+#     # Sort
+#     reverse = sort_dir == "desc"
+#     if sort_by == "weighted_score":
+#         calls.sort(key=lambda c: c["analysis"].get("weighted_score", 0), reverse=reverse)
+#     elif sort_by == "processed_at":
+#         calls.sort(key=lambda c: c.get("processed_at",""), reverse=reverse)
+#     else:
+#         calls.sort(key=lambda c: c.get(sort_by,""), reverse=reverse)
+    
+#     # Paginate
+#     start = (page-1)*page_size
+#     page_calls = calls[start:start+page_size]
+    
+#     # Slim version for table view
+#     slim = []
+#     for c in page_calls:
+#         a = c["analysis"]
+#         if not a.get("param_comments") or len(a.get("param_comments", [])) < len(PARAM_ORDER):
+#             a["param_comments"] = _fallback_param_comments(a.get("scores", {}))
+#         if not a.get("annotated_transcript"):
+#             a["annotated_transcript"] = _annotate_transcript(c.get("transcript", []), a)
+#         a["sentiment"] = _refine_sentiment(c.get("transcript", []), a.get("sentiment", "neutral"))
+#         a = _apply_qa_policy_rules(a, c.get("transcript", []))
+#         a["product_mentioned"] = _safe_filename_label(str(a.get("product_mentioned") or "None"))
+#         c["analysis"] = a
+#         failed_parameters = a.get("failed_parameters", [])
+#         score_reason = a.get("score_reason") or _score_reason(a)
+#         slim.append({
+#             "id": c["id"],
+#             "name": c["name"],
+#             "sl": c.get("sl",""),
+#             "category": a.get("category",""),
+#             "severity": a.get("severity","normal"),
+#             "weighted_score": a.get("weighted_score",0),
+#             "pass_fail": a.get("pass_fail",""),
+#             "sentiment": a.get("sentiment",""),
+#             "flags": a.get("flags",[]),
+#             "product_mentioned": a.get("product_mentioned",""),
+#             "products_mentioned": a.get("products_mentioned", []),
+#             "product_confidence": a.get("product_confidence", 0.0),
+#             "product_signals": a.get("product_signals", []),
+#             "fatal": c.get("fatal",False),
+#             "flagged": c.get("flagged",False),
+#             "turn_count": a.get("turn_count",0),
+#             "estimated_duration_minutes": a.get("estimated_duration_minutes",0),
+#             "processed_at": c.get("processed_at","") ,
+#             "score_reason": score_reason,
+#             "failed_parameters": failed_parameters
+#         })
+    
+#     return {"calls": slim, "total": total, "page": page, "page_size": page_size}
 @app.get("/api/calls")
 async def get_calls(
     page: int = Query(1, ge=1),
@@ -2752,144 +3653,145 @@ async def get_calls(
     search: Optional[str] = None,
     job_id: Optional[str] = None,
     sort_by: str = "processed_at",
-    sort_dir: str = "desc"
+    sort_dir: str = "desc",
 ):
-    db = load_db()
-    calls = db["calls"]
-    
-    # Filters
-    if severity:
-        calls = [c for c in calls if c["analysis"].get("severity") == severity]
-    if category:
-        calls = [c for c in calls if c["analysis"].get("category") == category]
-    if sentiment:
-        calls = [c for c in calls if c["analysis"].get("sentiment") == sentiment]
-    if pass_fail:
-        calls = [c for c in calls if c["analysis"].get("pass_fail") == pass_fail]
-    if flagged is not None:
-        calls = [c for c in calls if c.get("flagged") == flagged]
-    if job_id:
-        calls = [c for c in calls if c.get("job_id") == job_id]
-    if search:
-        s = search.lower()
-        calls = [c for c in calls if s in c["name"].lower() or s in c.get("raw_text","").lower()]
-    
-    total = len(calls)
-    
-    # Sort
-    reverse = sort_dir == "desc"
-    if sort_by == "weighted_score":
-        calls.sort(key=lambda c: c["analysis"].get("weighted_score", 0), reverse=reverse)
-    elif sort_by == "processed_at":
-        calls.sort(key=lambda c: c.get("processed_at",""), reverse=reverse)
-    else:
-        calls.sort(key=lambda c: c.get(sort_by,""), reverse=reverse)
-    
-    # Paginate
-    start = (page-1)*page_size
-    page_calls = calls[start:start+page_size]
-    
-    # Slim version for table view
-    slim = []
-    for c in page_calls:
-        a = c["analysis"]
-        if not a.get("param_comments") or len(a.get("param_comments", [])) < len(PARAM_ORDER):
-            a["param_comments"] = _fallback_param_comments(a.get("scores", {}))
-        if not a.get("annotated_transcript"):
-            a["annotated_transcript"] = _annotate_transcript(c.get("transcript", []), a)
-        a["sentiment"] = _refine_sentiment(c.get("transcript", []), a.get("sentiment", "neutral"))
-        a = _apply_qa_policy_rules(a, c.get("transcript", []))
-        a["product_mentioned"] = _safe_filename_label(str(a.get("product_mentioned") or "None"))
-        c["analysis"] = a
-        failed_parameters = a.get("failed_parameters", [])
-        score_reason = a.get("score_reason") or _score_reason(a)
-        slim.append({
-            "id": c["id"],
-            "name": c["name"],
-            "sl": c.get("sl",""),
-            "category": a.get("category",""),
-            "severity": a.get("severity","normal"),
-            "weighted_score": a.get("weighted_score",0),
-            "pass_fail": a.get("pass_fail",""),
-            "sentiment": a.get("sentiment",""),
-            "flags": a.get("flags",[]),
-            "product_mentioned": a.get("product_mentioned",""),
-            "products_mentioned": a.get("products_mentioned", []),
-            "product_confidence": a.get("product_confidence", 0.0),
-            "product_signals": a.get("product_signals", []),
-            "fatal": c.get("fatal",False),
-            "flagged": c.get("flagged",False),
-            "turn_count": a.get("turn_count",0),
-            "estimated_duration_minutes": a.get("estimated_duration_minutes",0),
-            "processed_at": c.get("processed_at","") ,
-            "score_reason": score_reason,
-            "failed_parameters": failed_parameters
-        })
-    
-    return {"calls": slim, "total": total, "page": page, "page_size": page_size}
+    return list_analyzed_calls(
+        page=page, page_size=page_size,
+        severity=severity, category=category, sentiment=sentiment,
+        pass_fail=pass_fail, flagged=flagged, job_id=job_id,
+        search=search, sort_by=sort_by, sort_dir=sort_dir,
+    )
 
+# @app.get("/api/calls/{call_id}")
+# async def get_call_detail(call_id: str):
+#     db = load_db()
+#     call = next((c for c in db["calls"] if c["id"] == call_id), None)
+#     if not call:
+#         raise HTTPException(404, "Call not found")
+#     a = call.get("analysis", {})
+#     if not a.get("param_comments") or len(a.get("param_comments", [])) < len(PARAM_ORDER):
+#         a["param_comments"] = _fallback_param_comments(a.get("scores", {}))
+#     if not a.get("annotated_transcript"):
+#         a["annotated_transcript"] = _annotate_transcript(call.get("transcript", []), a)
+#     a["sentiment"] = _refine_sentiment(call.get("transcript", []), a.get("sentiment", "neutral"))
+#     a = _apply_qa_policy_rules(a, call.get("transcript", []))
+#     a["product_mentioned"] = _safe_filename_label(str(a.get("product_mentioned") or "None"))
+#     call["analysis"] = a
+#     return call
+# ── /api/calls/{call_id} ─────────────────────────────────────────────────────
 @app.get("/api/calls/{call_id}")
 async def get_call_detail(call_id: str):
-    db = load_db()
-    call = next((c for c in db["calls"] if c["id"] == call_id), None)
+    call = get_analyzed_call(call_id)
     if not call:
         raise HTTPException(404, "Call not found")
     a = call.get("analysis", {})
     if not a.get("param_comments") or len(a.get("param_comments", [])) < len(PARAM_ORDER):
         a["param_comments"] = _fallback_param_comments(a.get("scores", {}))
     if not a.get("annotated_transcript"):
-        a["annotated_transcript"] = _annotate_transcript(call.get("transcript", []), a)
-    a["sentiment"] = _refine_sentiment(call.get("transcript", []), a.get("sentiment", "neutral"))
-    a = _apply_qa_policy_rules(a, call.get("transcript", []))
-    a["product_mentioned"] = _safe_filename_label(str(a.get("product_mentioned") or "None"))
+        a["annotated_transcript"] = _annotate_transcript(
+            call.get("transcript", []), a
+        )
     call["analysis"] = a
     return call
 
+# @app.get("/api/export/calls.xlsx")
+# async def export_calls_excel():
+#     db = load_db()
+#     rows = []
+#     for c in db.get("calls", []):
+#         a = c.get("analysis", {})
+#         scores = a.get("scores", {})
+#         rows.append({
+#             "id": c.get("id", ""),
+#             "job_id": c.get("job_id", ""),
+#             "name": c.get("name", ""),
+#             "sl": c.get("sl", ""),
+#             "processed_at": c.get("processed_at", ""),
+#             "pass_fail": a.get("pass_fail", ""),
+#             "severity": a.get("severity", ""),
+#             "category": a.get("category", ""),
+#             "sentiment": a.get("sentiment", ""),
+#             "weighted_score": a.get("weighted_score", 0),
+#             "score_reason": a.get("score_reason", ""),
+#             "failed_parameters": ", ".join(a.get("failed_parameters", [])),
+#             "flags": ", ".join(a.get("flags", [])),
+#             "product_mentioned": a.get("product_mentioned", ""),
+#             "products_mentioned": ", ".join(a.get("products_mentioned", []) or []),
+#             "product_confidence": a.get("product_confidence", 0),
+#             "product_signals": ", ".join(a.get("product_signals", [])),
+#             "product_accuracy_score": a.get("product_accuracy_score", ""),
+#             "product_issues": a.get("product_issues", ""),
+#             "strengths": a.get("strengths", ""),
+#             "summary": a.get("summary", ""),
+#             "qa_findings": " | ".join(f.get("text", "") for f in a.get("qa_findings", [])),
+#             "greeting_opening": scores.get("greeting_opening", ""),
+#             "query_understanding": scores.get("query_understanding", ""),
+#             "response_accuracy": scores.get("response_accuracy", ""),
+#             "communication_quality": scores.get("communication_quality", ""),
+#             "compliance": scores.get("compliance", ""),
+#             "personalisation": scores.get("personalisation", ""),
+#             "empathy_soft_skills": scores.get("empathy_soft_skills", ""),
+#             "resolution": scores.get("resolution", ""),
+#             "system_behaviour": scores.get("system_behaviour", ""),
+#             "closing_interaction": scores.get("closing_interaction", ""),
+#             "raw_text": c.get("raw_text", ""),
+#         })
 
+#     df = pd.DataFrame(rows)
+#     stream = io.BytesIO()
+#     with pd.ExcelWriter(stream, engine="openpyxl") as writer:
+#         df.to_excel(writer, index=False, sheet_name="calls")
+#     stream.seek(0)
+#     return StreamingResponse(
+#         stream,
+#         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+#         headers={"Content-Disposition": "attachment; filename=calls_export.xlsx"},
+#     )
 @app.get("/api/export/calls.xlsx")
 async def export_calls_excel():
-    db = load_db()
-    rows = []
-    for c in db.get("calls", []):
-        a = c.get("analysis", {})
-        scores = a.get("scores", {})
-        rows.append({
-            "id": c.get("id", ""),
-            "job_id": c.get("job_id", ""),
-            "name": c.get("name", ""),
-            "sl": c.get("sl", ""),
-            "processed_at": c.get("processed_at", ""),
-            "pass_fail": a.get("pass_fail", ""),
-            "severity": a.get("severity", ""),
-            "category": a.get("category", ""),
-            "sentiment": a.get("sentiment", ""),
-            "weighted_score": a.get("weighted_score", 0),
-            "score_reason": a.get("score_reason", ""),
-            "failed_parameters": ", ".join(a.get("failed_parameters", [])),
-            "flags": ", ".join(a.get("flags", [])),
-            "product_mentioned": a.get("product_mentioned", ""),
-            "products_mentioned": ", ".join(a.get("products_mentioned", []) or []),
-            "product_confidence": a.get("product_confidence", 0),
-            "product_signals": ", ".join(a.get("product_signals", [])),
-            "product_accuracy_score": a.get("product_accuracy_score", ""),
-            "product_issues": a.get("product_issues", ""),
-            "strengths": a.get("strengths", ""),
-            "summary": a.get("summary", ""),
-            "qa_findings": " | ".join(f.get("text", "") for f in a.get("qa_findings", [])),
-            "greeting_opening": scores.get("greeting_opening", ""),
-            "query_understanding": scores.get("query_understanding", ""),
-            "response_accuracy": scores.get("response_accuracy", ""),
-            "communication_quality": scores.get("communication_quality", ""),
-            "compliance": scores.get("compliance", ""),
-            "personalisation": scores.get("personalisation", ""),
-            "empathy_soft_skills": scores.get("empathy_soft_skills", ""),
-            "resolution": scores.get("resolution", ""),
-            "system_behaviour": scores.get("system_behaviour", ""),
-            "closing_interaction": scores.get("closing_interaction", ""),
-            "raw_text": c.get("raw_text", ""),
+    from db import db_cursor  # already imported but explicit here for clarity
+    with db_cursor(commit=False) as cur:
+        cur.execute("SELECT * FROM analyzed_calls ORDER BY processed_at DESC")
+        rows = cur.fetchall()
+ 
+    export_rows = []
+    for r in rows:
+        a = r.get("analysis") or {}
+        scores = a.get("scores") or {}
+        export_rows.append({
+            "id":                    r.get("id",""),
+            "job_id":                r.get("job_id",""),
+            "name":                  r.get("name",""),
+            "sl":                    r.get("sl",""),
+            "processed_at":          str(r.get("processed_at","")),
+            "pass_fail":             r.get("pass_fail",""),
+            "severity":              r.get("severity",""),
+            "category":              r.get("category",""),
+            "sentiment":             r.get("sentiment",""),
+            "weighted_score":        float(r.get("weighted_score") or 0),
+            "failed_parameters":     ", ".join(r.get("failed_parameters") or []),
+            "flags":                 ", ".join(r.get("flags") or []),
+            "fatal":                 r.get("fatal", False),
+            "flagged":               r.get("flagged", False),
+            "product_mentioned":     r.get("product_mentioned",""),
+            "product_confidence":    float(r.get("product_confidence") or 0),
+            "product_accuracy_score":r.get("product_accuracy_score",""),
+            "product_issues":        r.get("product_issues",""),
+            "strengths":             a.get("strengths",""),
+            "summary":               a.get("summary",""),
+            "greeting_opening":      scores.get("greeting_opening",""),
+            "query_understanding":   scores.get("query_understanding",""),
+            "response_accuracy":     scores.get("response_accuracy",""),
+            "communication_quality": scores.get("communication_quality",""),
+            "compliance":            scores.get("compliance",""),
+            "personalisation":       scores.get("personalisation",""),
+            "empathy_soft_skills":   scores.get("empathy_soft_skills",""),
+            "resolution":            scores.get("resolution",""),
+            "system_behaviour":      scores.get("system_behaviour",""),
+            "closing_interaction":   scores.get("closing_interaction",""),
         })
-
-    df = pd.DataFrame(rows)
+ 
+    df = pd.DataFrame(export_rows)
     stream = io.BytesIO()
     with pd.ExcelWriter(stream, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="calls")
@@ -2899,7 +3801,6 @@ async def export_calls_excel():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=calls_export.xlsx"},
     )
-
 
 @app.get("/api/calls/{call_id}/report.pdf")
 async def export_call_report_pdf(call_id: str):
@@ -2967,120 +3868,201 @@ async def export_call_report_pdf(call_id: str):
         headers={"Content-Disposition": f"attachment; filename=call_report_{call_id}.pdf"},
     )
 
+# @app.delete("/api/calls/{call_id}")
+# async def delete_call(call_id: str):
+#     db = load_db()
+#     calls = db.get("calls", [])
+#     before = len(calls)
+#     db["calls"] = [c for c in calls if c.get("id") != call_id]
+#     if len(db["calls"]) == before:
+#         raise HTTPException(404, "Call not found")
+#     save_db(db)
+#     return {"deleted": call_id, "message": "Call removed"}
 @app.delete("/api/calls/{call_id}")
 async def delete_call(call_id: str):
-    db = load_db()
-    calls = db.get("calls", [])
-    before = len(calls)
-    db["calls"] = [c for c in calls if c.get("id") != call_id]
-    if len(db["calls"]) == before:
+    deleted = delete_analyzed_call(call_id)
+    if not deleted:
         raise HTTPException(404, "Call not found")
-    save_db(db)
     return {"deleted": call_id, "message": "Call removed"}
 
+# @app.get("/api/dashboard")
+# async def get_dashboard():
+#     db = load_db()
+#     calls = db["calls"]
+#     if not calls:
+#         return {"total": 0, "message": "No calls processed yet"}
+    
+#     scores = [c["analysis"].get("weighted_score",0) for c in calls]
+#     severities = {}
+#     categories = {}
+#     sentiments = {}
+#     param_scores = {k:[] for k in ["greeting_opening","query_understanding","response_accuracy",
+#                                      "communication_quality","compliance","personalisation",
+#                                      "empathy_soft_skills","resolution","system_behaviour","closing_interaction"]}
+#     flags_count = {}
+#     daily_counts = {}
+#     product_counts = {}
+#     product_confidence = defaultdict(list)
+#     pass_count = fail_count = 0
+#     fatal_count = flagged_count = 0
+    
+#     for c in calls:
+#         a = c["analysis"]
+#         sev = a.get("severity","normal")
+#         severities[sev] = severities.get(sev,0)+1
+#         cat = a.get("category","Unknown")
+#         categories[cat] = categories.get(cat,0)+1
+#         sent = _refine_sentiment(c.get("transcript", []), a.get("sentiment","neutral"))
+#         sentiments[sent] = sentiments.get(sent,0)+1
+#         if a.get("pass_fail") == "PASS": pass_count += 1
+#         else: fail_count += 1
+#         if c.get("fatal"): fatal_count += 1
+#         if c.get("flagged"): flagged_count += 1
+#         product = _safe_filename_label(str(a.get("product_mentioned") or "None"))
+#         product_counts[product] = product_counts.get(product, 0) + 1
+#         if a.get("product_confidence") is not None:
+#             product_confidence[product].append(float(a.get("product_confidence") or 0))
+#         for f in a.get("flags",[]):
+#             flags_count[f] = flags_count.get(f,0)+1
+#         for k in param_scores:
+#             v = a.get("scores",{}).get(k)
+#             if v: param_scores[k].append(v)
+#         date_key = c.get("processed_at","")[:10]
+#         if date_key:
+#             daily_counts[date_key] = daily_counts.get(date_key,0)+1
+    
+#     avg_param = {k: round(sum(v)/len(v),2) if v else 0 for k,v in param_scores.items()}
+#     avg_product_confidence = {k: round(sum(v)/len(v), 3) if v else 0 for k, v in product_confidence.items()}
+    
+#     return {
+#         "total_calls": len(calls),
+#         "avg_score": round(sum(scores)/len(scores),2),
+#         "pass_rate": round(pass_count/len(calls)*100,1),
+#         "fail_count": fail_count,
+#         "fatal_count": fatal_count,
+#         "flagged_count": flagged_count,
+#         "severities": severities,
+#         "categories": categories,
+#         "sentiments": sentiments,
+#         "flags_breakdown": flags_count,
+#         "avg_parameter_scores": avg_param,
+#         "product_breakdown": dict(sorted(product_counts.items(), key=lambda item: item[1], reverse=True)),
+#         "avg_product_confidence": avg_product_confidence,
+#         "score_distribution": {
+#             "excellent": sum(1 for s in scores if s >= 85),
+#             "good": sum(1 for s in scores if 70 <= s < 85),
+#             "average": sum(1 for s in scores if 55 <= s < 70),
+#             "poor": sum(1 for s in scores if s < 55)
+#         },
+#         "daily_volume": dict(sorted(daily_counts.items())),
+#         "jobs_summary": {
+#             "total": len(db["jobs"]),
+#             "completed": sum(1 for j in db["jobs"] if j.get("status")=="completed"),
+#             "processing": sum(1 for j in db["jobs"] if j.get("status")=="processing"),
+#             "queued": sum(1 for j in db["jobs"] if j.get("status")=="queued")
+#         }
+#     }
 @app.get("/api/dashboard")
 async def get_dashboard():
-    db = load_db()
-    calls = db["calls"]
-    if not calls:
-        return {"total": 0, "message": "No calls processed yet"}
-    
-    scores = [c["analysis"].get("weighted_score",0) for c in calls]
-    severities = {}
-    categories = {}
-    sentiments = {}
-    param_scores = {k:[] for k in ["greeting_opening","query_understanding","response_accuracy",
-                                     "communication_quality","compliance","personalisation",
-                                     "empathy_soft_skills","resolution","system_behaviour","closing_interaction"]}
-    flags_count = {}
-    daily_counts = {}
-    product_counts = {}
-    product_confidence = defaultdict(list)
-    pass_count = fail_count = 0
-    fatal_count = flagged_count = 0
-    
-    for c in calls:
-        a = c["analysis"]
-        sev = a.get("severity","normal")
-        severities[sev] = severities.get(sev,0)+1
-        cat = a.get("category","Unknown")
-        categories[cat] = categories.get(cat,0)+1
-        sent = _refine_sentiment(c.get("transcript", []), a.get("sentiment","neutral"))
-        sentiments[sent] = sentiments.get(sent,0)+1
-        if a.get("pass_fail") == "PASS": pass_count += 1
-        else: fail_count += 1
-        if c.get("fatal"): fatal_count += 1
-        if c.get("flagged"): flagged_count += 1
-        product = _safe_filename_label(str(a.get("product_mentioned") or "None"))
-        product_counts[product] = product_counts.get(product, 0) + 1
-        if a.get("product_confidence") is not None:
-            product_confidence[product].append(float(a.get("product_confidence") or 0))
-        for f in a.get("flags",[]):
-            flags_count[f] = flags_count.get(f,0)+1
-        for k in param_scores:
-            v = a.get("scores",{}).get(k)
-            if v: param_scores[k].append(v)
-        date_key = c.get("processed_at","")[:10]
-        if date_key:
-            daily_counts[date_key] = daily_counts.get(date_key,0)+1
-    
-    avg_param = {k: round(sum(v)/len(v),2) if v else 0 for k,v in param_scores.items()}
-    avg_product_confidence = {k: round(sum(v)/len(v), 3) if v else 0 for k, v in product_confidence.items()}
-    
-    return {
-        "total_calls": len(calls),
-        "avg_score": round(sum(scores)/len(scores),2),
-        "pass_rate": round(pass_count/len(calls)*100,1),
-        "fail_count": fail_count,
-        "fatal_count": fatal_count,
-        "flagged_count": flagged_count,
-        "severities": severities,
-        "categories": categories,
-        "sentiments": sentiments,
-        "flags_breakdown": flags_count,
-        "avg_parameter_scores": avg_param,
-        "product_breakdown": dict(sorted(product_counts.items(), key=lambda item: item[1], reverse=True)),
-        "avg_product_confidence": avg_product_confidence,
-        "score_distribution": {
-            "excellent": sum(1 for s in scores if s >= 85),
-            "good": sum(1 for s in scores if 70 <= s < 85),
-            "average": sum(1 for s in scores if 55 <= s < 70),
-            "poor": sum(1 for s in scores if s < 55)
-        },
-        "daily_volume": dict(sorted(daily_counts.items())),
-        "jobs_summary": {
-            "total": len(db["jobs"]),
-            "completed": sum(1 for j in db["jobs"] if j.get("status")=="completed"),
-            "processing": sum(1 for j in db["jobs"] if j.get("status")=="processing"),
-            "queued": sum(1 for j in db["jobs"] if j.get("status")=="queued")
-        }
-    }
+    return get_dashboard_stats()
+# @app.post("/api/jobs/{job_id}/cancel")
+# async def cancel_job(job_id: str):
+#     db = load_db()
+#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+#     if not job:
+#         raise HTTPException(404, "Job not found")
+#     status = job.get("status")
+#     if status in {"completed", "cancelled", "failed"}:
+#         raise HTTPException(400, f"Job is already {status}")
+#     signal_job(job_id, "cancel")
+#     return {"job_id": job_id, "signal": "cancel", "message": "Cancellation signal sent — will stop after current transcript"}
 
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") in {"completed", "cancelled", "failed"}:
+        raise HTTPException(400, f"Job is already {job['status']}")
+    signal_job(job_id, "cancel")
+    return {"job_id": job_id, "signal": "cancel",
+            "message": "Cancellation signal sent — will stop after current transcript"}
+@app.post("/api/jobs/{job_id}/pause")
+async def pause_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "processing":
+        raise HTTPException(400, f"Can only pause a processing job (current: {job.get('status')})")
+    signal_job(job_id, "pause")
+    return {"job_id": job_id, "signal": "pause",
+            "message": "Pause signal sent — will pause after current transcript"}
+ 
+@app.post("/api/jobs/{job_id}/resume")
+async def resume_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "paused":
+        raise HTTPException(400, f"Can only resume a paused job (current: {job.get('status')})")
+    signal_job(job_id, "resume")
+    return {"job_id": job_id, "signal": "resume", "message": "Resume signal sent"}
+    
+# @app.post("/api/jobs/{job_id}/pause")
+# async def pause_job(job_id: str):
+#     db = load_db()
+#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+#     if not job:
+#         raise HTTPException(404, "Job not found")
+#     if job.get("status") != "processing":
+#         raise HTTPException(400, f"Can only pause a processing job (current: {job.get('status')})")
+#     signal_job(job_id, "pause")
+#     return {"job_id": job_id, "signal": "pause", "message": "Pause signal sent — will pause after current transcript"}
+
+
+# @app.post("/api/jobs/{job_id}/resume")
+# async def resume_job(job_id: str):
+#     db = load_db()
+#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
+#     if not job:
+#         raise HTTPException(404, "Job not found")
+#     if job.get("status") != "paused":
+#         raise HTTPException(400, f"Can only resume a paused job (current: {job.get('status')})")
+#     signal_job(job_id, "resume")
+#     return {"job_id": job_id, "signal": "resume", "message": "Resume signal sent"}
+# @app.get("/api/fatal-calls")
+# async def get_fatal_calls():
+#     db = load_db()
+#     fatals = [c for c in db["calls"] if c.get("fatal") or c["analysis"].get("severity") in ["fatal","critical"]]
+#     return [{
+#         "id": c["id"], "name": c["name"],
+#         "severity": c["analysis"].get("severity"),
+#         "fatal_reason": c["analysis"].get("fatal_reason",""),
+#         "flags": c["analysis"].get("flags",[]),
+#         "weighted_score": c["analysis"].get("weighted_score",0),
+#         "category": c["analysis"].get("category",""),
+#         "processed_at": c.get("processed_at","")
+#     } for c in fatals]
 @app.get("/api/fatal-calls")
-async def get_fatal_calls():
-    db = load_db()
-    fatals = [c for c in db["calls"] if c.get("fatal") or c["analysis"].get("severity") in ["fatal","critical"]]
-    return [{
-        "id": c["id"], "name": c["name"],
-        "severity": c["analysis"].get("severity"),
-        "fatal_reason": c["analysis"].get("fatal_reason",""),
-        "flags": c["analysis"].get("flags",[]),
-        "weighted_score": c["analysis"].get("weighted_score",0),
-        "category": c["analysis"].get("category",""),
-        "processed_at": c.get("processed_at","")
-    } for c in fatals]
-
+async def get_fatal_calls_endpoint():
+    return db_get_fatal_calls()
+# @app.delete("/api/calls")
+# async def clear_all_calls():
+#     db = load_db()
+#     db["calls"] = []
+#     db["jobs"] = []
+#     save_db(db)
+#     for job_dir in UPLOAD_DIR.glob("*"):
+#         if job_dir.is_dir():
+#             shutil.rmtree(job_dir, ignore_errors=True)
+#     return {"message": "All data cleared"}
 @app.delete("/api/calls")
 async def clear_all_calls():
-    db = load_db()
-    db["calls"] = []
-    db["jobs"] = []
-    save_db(db)
+    clear_all_data()
     for job_dir in UPLOAD_DIR.glob("*"):
         if job_dir.is_dir():
             shutil.rmtree(job_dir, ignore_errors=True)
     return {"message": "All data cleared"}
-
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

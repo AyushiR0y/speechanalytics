@@ -86,6 +86,8 @@ async function livePollTick() {
       if (!job || !job.id) { pendingJobs.delete(jid); return; }
       totalQueued    += (job.total || 0);
       totalProcessed += (job.processed || 0);
+      // Cancel
+
       if (job.status === 'completed' || job.status === 'failed') {
         pendingJobs.delete(jid);
       } else {
@@ -93,7 +95,54 @@ async function livePollTick() {
       }
     } catch {}
   }));
+async function cancelJob(jobId) {
+  try {
+    await fetch(`${API}/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    pendingJobs.delete(jobId);
+    stopLivePolling();
+    showToast('Job cancelled', 'info');
+    refreshCurrentView();
+  } catch {
+    showToast('Failed to cancel job', 'error');
+  }
+}
 
+async function pauseJob(jobId) {
+  try {
+    await fetch(`${API}/api/jobs/${jobId}/pause`, { method: 'POST' });
+    showToast('Job paused', 'info');
+  } catch {
+    showToast('Failed to pause job', 'error');
+  }
+}
+
+async function resumeJob(jobId) {
+  try {
+    await fetch(`${API}/api/jobs/${jobId}/resume`, { method: 'POST' });
+    pendingJobs.add(jobId);
+    startLivePolling();
+    showToast('Job resumed', 'success');
+  } catch {
+    showToast('Failed to resume job', 'error');
+  }
+}
+function getJobActions(job) {
+    const { id, status } = job;
+    const actions = [];
+
+    if (status === "processing") {
+        actions.push({ label: "⏸ Pause",  fn: () => fetch(`/api/jobs/${id}/pause`,  { method: 'POST' }) });
+        actions.push({ label: "⛔ Cancel", fn: () => fetch(`/api/jobs/${id}/cancel`, { method: 'POST' }) });
+    }
+    if (status === "paused") {
+        actions.push({ label: "▶ Resume", fn: () => fetch(`/api/jobs/${id}/resume`, { method: 'POST' }) });
+        actions.push({ label: "⛔ Cancel", fn: () => fetch(`/api/jobs/${id}/cancel`, { method: 'POST' }) });
+    }
+    if (status === "queued") {
+        actions.push({ label: "⛔ Cancel", fn: () => fetch(`/api/jobs/${id}/cancel`, { method: 'POST' }) });
+    }
+    return actions;
+}
   updateLivePill(totalProcessed, totalQueued);
   updateLiveStrip(totalProcessed, totalQueued, pendingJobs.size);
 
@@ -1104,39 +1153,85 @@ async function deleteAllCalls() {
 // ── Jobs ──────────────────────────────────────────────────────────────────────
 async function loadJobs() {
   try {
-    const jobs = await fetch(`${API}/api/jobs`).then(r=>r.json());
+    const jobs = await fetch(`${API}/api/jobs`).then(r => r.json());
     const list = document.getElementById('jobs-list');
-    if (!jobs.length) {
+    const arr = Array.isArray(jobs) ? jobs : (jobs.jobs || []);
+
+    if (!arr.length) {
       list.innerHTML = '<div style="color:var(--text-3);font-size:14px;padding:40px;text-align:center">No processing jobs yet</div>';
       return;
     }
-    list.innerHTML = jobs.reverse().map(j => {
+
+    list.innerHTML = arr.slice().reverse().map(j => {
       const pct = j.total > 0 ? Math.round(j.processed / j.total * 100) : 0;
+      const jid = j.id;
+
+      // Build action buttons based on current status
+      let actionBtns = '';
+      if (j.status === 'processing') {
+        actionBtns = `
+          <button class="job-action-btn pause-btn"  onclick="pauseJob('${jid}')">⏸ Pause</button>
+          <button class="job-action-btn cancel-btn" onclick="cancelJob('${jid}')">⛔ Cancel</button>
+        `;
+      } else if (j.status === 'paused') {
+        actionBtns = `
+          <button class="job-action-btn resume-btn" onclick="resumeJob('${jid}')">▶ Resume</button>
+          <button class="job-action-btn cancel-btn" onclick="cancelJob('${jid}')">⛔ Cancel</button>
+        `;
+      } else if (j.status === 'queued') {
+        actionBtns = `
+          <button class="job-action-btn cancel-btn" onclick="cancelJob('${jid}')">⛔ Cancel</button>
+        `;
+      }
+
+      const statusColors = {
+        processing: 'var(--primary)',
+        completed:  'var(--normal)',
+        paused:     'var(--watch)',
+        cancelled:  'var(--text-3)',
+        queued:     'var(--text-2)',
+        failed:     'var(--fatal)'
+      };
+
       return `
-        <div class="job-card">
+        <div class="job-card" id="job-card-${jid}">
           <div class="job-header">
             <div>
-              <div style="font-weight:600;font-size:13.5px">${j.files?.length || 0} file(s) uploaded</div>
-              <div class="job-id">Job ${j.id.slice(0,12)}…</div>
+              <div style="font-weight:600;font-size:13.5px">${j.files?.length || 0} file(s)</div>
+              <div class="job-id">Job ${jid.slice(0, 12)}…</div>
             </div>
-            <span class="job-status-badge ${j.status}">${j.status}</span>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span class="job-status-badge ${j.status}"
+                    style="color:${statusColors[j.status] || 'inherit'}">
+                ${j.status}
+              </span>
+              <div class="job-actions">${actionBtns}</div>
+            </div>
           </div>
-          <div class="job-files">${(j.files||[]).slice(0,5).map(escHtml).join(', ')}${j.files?.length > 5 ? ` +${j.files.length-5} more` : ''}</div>
+          <div class="job-files">
+            ${(j.files || []).slice(0, 5).map(escHtml).join(', ')}
+            ${j.files?.length > 5 ? ` +${j.files.length - 5} more` : ''}
+          </div>
           <div class="job-progress-row">
-            <div class="job-progress-bar"><div class="job-progress-fill" style="width:${pct}%"></div></div>
-            <span class="job-progress-text">${j.processed||0}/${j.total||0} calls</span>
+            <div class="job-progress-bar">
+              <div class="job-progress-fill" style="width:${pct}%"></div>
+            </div>
+            <span class="job-progress-text">${j.processed || 0}/${j.total || 0} calls (${pct}%)</span>
           </div>
           <div style="margin-top:8px;font-size:11.5px;color:var(--text-3)">
-            Started: ${new Date(j.created_at||'').toLocaleString('en-IN')}
-            ${j.fatal_count ? `• <span style="color:var(--fatal)">⚠ ${j.fatal_count} fatal</span>` : ''}
-            ${j.flag_count  ? `• <span style="color:var(--watch)">🔴 ${j.flag_count} flagged</span>` : ''}
+            Started: ${new Date(j.created_at || '').toLocaleString('en-IN')}
+            ${j.completed_at ? ` • Ended: ${new Date(j.completed_at).toLocaleString('en-IN')}` : ''}
+            ${j.fatal_count ? ` • <span style="color:var(--fatal)">⚠ ${j.fatal_count} fatal</span>` : ''}
+            ${j.flag_count  ? ` • <span style="color:var(--watch)">🔴 ${j.flag_count} flagged</span>` : ''}
           </div>
         </div>
       `;
     }).join('');
-  } catch(e) { console.error('Jobs error:', e); }
-}
 
+  } catch (e) {
+    console.error('Jobs error:', e);
+  }
+}
 // Legacy alias retained for safety — delegates to the new live poller.
 async function pollJobs() {
   if (pendingJobs.size > 0) startLivePolling();

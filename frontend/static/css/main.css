@@ -906,7 +906,22 @@ body {
 .job-progress-bar { flex: 1; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
 .job-progress-fill { height: 100%; background: var(--primary); border-radius: 3px; }
 .job-progress-text { font-size: 12px; font-family: var(--font-mono); color: var(--text-3); }
+.job-actions { display: flex; gap: 6px; }
 
+.job-action-btn {
+  padding: 4px 10px;
+  border: none;
+  border-radius: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.job-action-btn:hover { opacity: 0.82; }
+
+.pause-btn  { background: #fde68a; color: #92400e; }
+.resume-btn { background: #a7f3d0; color: #065f46; }
+.cancel-btn { background: #fecaca; color: #991b1b; }
 /* ── Products ──────────────────────────────────────────────────────────────── */
 .products-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }
 .products-left { display: flex; flex-direction: column; gap: 14px; }
