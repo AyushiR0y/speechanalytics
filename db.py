@@ -18,6 +18,8 @@ import psycopg2.extras
 from psycopg2.extras import RealDictCursor
 
 log = logging.getLogger("speech_analytics.db")
+from dotenv import load_dotenv
+load_dotenv() 
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
