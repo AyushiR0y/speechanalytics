@@ -523,62 +523,6 @@ with rec_cols[1]:
 
 st.markdown("---")
 
-# ═══════════════════════════════════════════
-# SECTION 6 – USAGE LOG SETUP INSTRUCTIONS
-# ═══════════════════════════════════════════
-with st.expander("🛠️  Enable exact token tracking in main.py (one-time setup)"):
-    st.markdown(
-        """
-        The dashboard currently **estimates** token counts from transcript lengths.
-        To capture **exact** token counts from the OpenAI API response, add the patch below
-        to your `backend/main.py`.
-
-        ### 1. Add a usage logger function (after the `load_db` helpers)
-
-        ```python
-        # ── API Usage Logger ─────────────────────────────────────────────────────────
-        USAGE_FILE = PROC_DIR / "api_usage_log.json"
-
-        def log_api_usage(model: str, input_tokens: int, output_tokens: int, call_name: str = ""):
-            entry = {
-                "timestamp":     datetime.now().isoformat(),
-                "model":         model,
-                "input_tokens":  input_tokens,
-                "output_tokens": output_tokens,
-                "call_name":     call_name,
-            }
-            try:
-                existing = json.loads(USAGE_FILE.read_text()) if USAGE_FILE.exists() else []
-                existing.append(entry)
-                USAGE_FILE.write_text(json.dumps(existing, indent=2))
-            except Exception as e:
-                log.warning(f"Usage log write error: {e}")
-        ```
-
-        ### 2. Patch `analyze_call_with_gpt4o` to call the logger
-
-        Find the line:
-        ```python
-            raw = response.choices[0].message.content
-            return json.loads(raw)
-        ```
-        Replace with:
-        ```python
-            usage = response.usage
-            log_api_usage(
-                model=OPENAI_MODEL,
-                input_tokens=usage.prompt_tokens,
-                output_tokens=usage.completion_tokens,
-            )
-            raw = response.choices[0].message.content
-            return json.loads(raw)
-        ```
-
-        Once done, restart the server — all new calls will be logged to
-        `processed/api_usage_log.json` and this dashboard will switch from estimates
-        to exact figures automatically.
-        """
-    )
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(

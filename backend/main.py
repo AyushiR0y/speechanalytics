@@ -25,7 +25,7 @@ import openai
 from dotenv import load_dotenv
 import uuid as _uuid_mod  # already imported as uuid above — no change needed
  
-from db import (
+from backend.db import (
     create_job, update_job, get_job, list_jobs, increment_job_counters,
     insert_raw_call, get_raw_call,
     upsert_analyzed_call, get_analyzed_call, delete_analyzed_call,
@@ -761,6 +761,23 @@ def _is_system_failure_response(text: str) -> bool:
         return False
     return any(pat.search(text) for pat in _SYSTEM_FAILURE_PATTERNS)
 
+_ESCALATION_PATTERNS = re.compile(
+    r"\b(?:transfer(?:ring)?\s+you|connect(?:ing)?\s+you\s+to|"
+    r"escalat(?:e|ing|ed)|hand(?:ing)?\s+over\s+to|"
+    r"raise\s+a\s+(?:ticket|request)|loop\s+in\s+(?:an?\s+)?(?:agent|specialist)|"
+    r"(?:an?\s+)?(?:agent|specialist|representative|relationship\s+manager)\s+"
+    r"will\s+(?:get\s+back|reach\s+out|contact|call)|"
+    r"schedul(?:e|ing)\s+a\s+callback)\b",
+    re.IGNORECASE,
+)
+
+def _bot_escalated(turns: List[Dict[str, Any]]) -> bool:
+    """True if any bot turn offers escalation/transfer/callback."""
+    for t in turns or []:
+        if (t.get("speaker") or "").lower() in {"bot", "agent", "system"}:
+            if _ESCALATION_PATTERNS.search(t.get("text") or ""):
+                return True
+    return False
 
 # ── Transcript-level product-name extractor ─────────────────────────────────
 # Not all products mentioned in a call exist in the RAG index (e.g. a
@@ -775,37 +792,43 @@ _PRODUCT_NAME_PATTERNS = (
         r"\bBajaj(?:\s+Allianz)?(?:\s+Life)?(?:\s+Insurance)?"
         r"(?:\s+[A-Z][A-Za-z&]+){1,5}"
         r"(?:\s+(?:Plan|Policy|Insurance|Suraksha|Assure|Shield|Goal|Wealth|"
-        r"Smart|Term|Protector|Saver|Income|Sampoorn|Sampada|Lifestyle|"
-        r"Magnum|Future|Care|Eternal|Premier|Elite|Lakshya|Sanchay|Anand|"
-        r"Money|ULIP|Endowment))?\b"
+        r"Smart|Term|Protector|Saver|Income|Sampoorn|Sampada|Lifestyle|Protect|Invest|"
+        r"Magnum|Future|Care|Eternal|Premier|Elite|Lakshya|Sanchay|Anand|ACE|Guaranteed|Benefit|Care|"
+        r"Money|ULIP|eTouch|Family|Flexi|Future|Supreme|Endowment))?\b"
     ),
     # Stand-alone Bajaj product families ending with Plan/Policy/Insurance
     re.compile(
         r"\b(?:Goal|Smart|Lifestyle|Magnum|Future|Sampoorn|Sampada|Lakshya|"
-        r"Sanchay|Anand|Eternal|Premier|Shield|Wealth)\s+"
+        r"Sanchay|Anand|Eternal|Premier|eTouch|Guaranteed|Wealth|Cash|Shield|Wealth)\s+"
         r"(?:[A-Z][a-z]+\s+){0,3}"
         r"(?:Plan|Policy|Insurance|Suraksha|Assure|Shield)\b"
     ),
 )
+_GENERIC_PRODUCT_NAMES = {"none", "unknown", "", "bajaj life", "bajaj life insurance",
+                           "bajaj allianz life", "bajaj allianz life insurance", "bajaj allianz", "bajaj"}
 
 
 def _extract_product_mentions_from_text(text: str) -> List[str]:
-    """Find Bajaj Life Insurance product names embedded in the transcript,
-    even when they are NOT present in the RAG index. Returns a deduped,
-    title-cased list in first-appearance order."""
     if not text:
         return []
+
+    # Generic brand-only phrases that are NOT product names — must be rejected
+    # even after cleaning/title-casing, since they appear in scripted openings
+    # ("Bajaj Life Insurance mein aapka swagat hai") and would otherwise be
+    # picked up as a false "explicit mention".
+    _BRAND_ONLY = {
+        "bajaj life", "bajaj life insurance", "bajaj allianz life",
+        "bajaj allianz life insurance", "bajaj allianz", "bajaj",
+    }
 
     matches: List[str] = []
     seen: set = set()
     for pattern in _PRODUCT_NAME_PATTERNS:
         for m in pattern.finditer(text):
             raw = re.sub(r"\s+", " ", m.group(0).strip())
-            # Drop trailing punctuation that crept in
             raw = re.sub(r"[\.,;:!\?]+$", "", raw).strip()
             if len(raw) < 6:
                 continue
-            # Title-case while preserving short tokens / acronyms
             words = []
             for w in raw.split():
                 if w.lower() in {"of", "and", "the", "for", "with"}:
@@ -815,10 +838,11 @@ def _extract_product_mentions_from_text(text: str) -> List[str]:
                 else:
                     words.append(w[:1].upper() + w[1:].lower() if w else w)
             cleaned = " ".join(words)
-            # Normalise "Bajaj Allianz Life" → "Bajaj Life" to match _safe_filename_label
             cleaned = re.sub(r"(?i)\bbajaj\s+allianz\s+life\b", "Bajaj Life", cleaned)
             key = cleaned.lower()
-            if key not in seen and cleaned.lower() != "bajaj life":
+            if key in _BRAND_ONLY:
+                continue
+            if key not in seen:
                 seen.add(key)
                 matches.append(cleaned)
     return matches
@@ -953,7 +977,7 @@ def _build_product_checks(turns: List[Dict[str, Any]], analysis: Dict[str, Any])
         return len(wa & wb) / min(len(wa), len(wb))
 
     has_matching_spec = any(
-        _word_overlap_ratio(product_lower, p) >= 0.5
+        _word_overlap_ratio(product_lower, p) >= 0.35
         for p in available_rag_products
     )
     if not has_matching_spec:
@@ -1027,7 +1051,28 @@ def _build_product_checks(turns: List[Dict[str, Any]], analysis: Dict[str, Any])
 
     return checks
 
+def _restrict_failure_criteria(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Per business rule: a call should only FAIL if:
+       (a) true system failure (no escalation offered), or
+       (b) false_information (wrong product/policy facts), or
+       (c) rude/poor communication (communication_quality below min pass).
+    Other low scores (e.g. personalisation, closing) should not flip pass_fail."""
+    flags = set(analysis.get("flags") or [])
+    scores = analysis.get("scores") or {}
+    comm_score = int(scores.get("communication_quality", 5) or 5)
 
+    hard_fail_reasons = []
+    if "system_failure" in flags:
+        hard_fail_reasons.append("system_failure")
+    if "false_information" in flags:
+        hard_fail_reasons.append("false_information")
+    if comm_score < _PARAM_MIN_PASS["communication_quality"]:
+        hard_fail_reasons.append("communication_quality")
+
+    analysis["pass_fail"] = "FAIL" if hard_fail_reasons else "PASS"
+    analysis["fail_reasons"] = hard_fail_reasons
+    # Keep failed_parameters for visibility/reporting, but it no longer drives pass_fail alone
+    return analysis
 def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Safety-net rule layer.
 
@@ -1242,42 +1287,76 @@ def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]
             )
         if analysis.get("product_accuracy_score") in {None, "", 0}:
             analysis["product_accuracy_score"] = 3
-
+    
     # System failure rule (independent of product checks).
     # When the bot tells the customer it cannot fetch / retrieve / access the
     # requested data, the customer left the call WITHOUT what they asked for.
     # That is a hard system failure and must be FATAL, not a soft watch.
-    if unable_response and product_query:
-        scores["system_behaviour"] = min(int(scores.get("system_behaviour", 3) or 3), 1)
-        scores["compliance"] = min(int(scores.get("compliance", 3) or 3), 2)
-        scores["resolution"] = min(int(scores.get("resolution", 3) or 3), 1)
-        if "behavior_issue" not in flags:
-            flags.append("behavior_issue")
-        if "system_failure" not in flags:
-            flags.append("system_failure")
+    # if unable_response and product_query:
+    #     scores["system_behaviour"] = min(int(scores.get("system_behaviour", 3) or 3), 1)
+    #     scores["compliance"] = min(int(scores.get("compliance", 3) or 3), 2)
+    #     scores["resolution"] = min(int(scores.get("resolution", 3) or 3), 1)
+    #     if "behavior_issue" not in flags:
+    #         flags.append("behavior_issue")
+    #     if "system_failure" not in flags:
+    #         flags.append("system_failure")
 
-        # Promote severity to fatal (overrides hard_fail / risk_only branch above)
-        analysis["severity"] = "fatal"
-        analysis["pass_fail"] = "FAIL"
-        failure_quote = ""
-        if failed_bot_turn:
-            failure_quote = (failed_bot_turn.get("text") or "").strip()
+    #     # Promote severity to fatal (overrides hard_fail / risk_only branch above)
+    #     analysis["severity"] = "fatal"
+    #     analysis["pass_fail"] = "FAIL"
+    #     failure_quote = ""
+    #     if failed_bot_turn:
+    #         failure_quote = (failed_bot_turn.get("text") or "").strip()
+    #         if len(failure_quote) > 220:
+    #             failure_quote = failure_quote[:217].rstrip() + "…"
+    #     analysis["fatal_reason"] = (
+    #         f"System failure: bot was unable to fetch / retrieve the data the customer asked for"
+    #         + (f' — "{failure_quote}"' if failure_quote else ".")
+    #     )
+    #     existing_issues = (analysis.get("product_issues") or "").strip()
+    #     sf_issue = "System failure: bot could not fetch the requested policy data."
+    #     if not existing_issues or existing_issues.lower() in {"none", ""}:
+    #         analysis["product_issues"] = sf_issue
+    #     elif sf_issue.lower() not in existing_issues.lower():
+    #         analysis["product_issues"] = f"{existing_issues}; {sf_issue}"
+    #     for fp in ("system_behaviour", "resolution"):
+    #         if fp not in failed_parameters:
+    #             failed_parameters.append(fp)
+    if unable_response and product_query:
+        escalated = _bot_escalated(turns)
+        if not escalated:
+            # existing fatal-promotion logic stays as-is, unchanged
+            scores["system_behaviour"] = min(int(scores.get("system_behaviour", 3) or 3), 1)
+            scores["compliance"] = min(int(scores.get("compliance", 3) or 3), 2)
+            scores["resolution"] = min(int(scores.get("resolution", 3) or 3), 1)
+            if "behavior_issue" not in flags:
+                flags.append("behavior_issue")
+            if "system_failure" not in flags:
+                flags.append("system_failure")
+            analysis["severity"] = "fatal"
+            analysis["pass_fail"] = "FAIL"
+            failure_quote = (failed_bot_turn.get("text") or "").strip() if failed_bot_turn else ""
             if len(failure_quote) > 220:
                 failure_quote = failure_quote[:217].rstrip() + "…"
-        analysis["fatal_reason"] = (
-            f"System failure: bot was unable to fetch / retrieve the data the customer asked for"
-            + (f' — "{failure_quote}"' if failure_quote else ".")
-        )
-        existing_issues = (analysis.get("product_issues") or "").strip()
-        sf_issue = "System failure: bot could not fetch the requested policy data."
-        if not existing_issues or existing_issues.lower() in {"none", ""}:
-            analysis["product_issues"] = sf_issue
-        elif sf_issue.lower() not in existing_issues.lower():
-            analysis["product_issues"] = f"{existing_issues}; {sf_issue}"
-        for fp in ("system_behaviour", "resolution"):
-            if fp not in failed_parameters:
-                failed_parameters.append(fp)
-
+            analysis["fatal_reason"] = (
+                "System failure: bot was unable to fetch / retrieve the data the customer asked for"
+                + (f' — "{failure_quote}"' if failure_quote else ".")
+            )
+            existing_issues = (analysis.get("product_issues") or "").strip()
+            sf_issue = "System failure: bot could not fetch the requested policy data."
+            if not existing_issues or existing_issues.lower() in {"none", ""}:
+                analysis["product_issues"] = sf_issue
+            elif sf_issue.lower() not in existing_issues.lower():
+                analysis["product_issues"] = f"{existing_issues}; {sf_issue}"
+            for fp in ("system_behaviour", "resolution"):
+                if fp not in failed_parameters:
+                    failed_parameters.append(fp)
+        else:
+            # Correct escalation — resolution achieved via handoff, not a failure.
+            # Give a small dip to system_behaviour only if NOT already a clean escalation,
+            # otherwise leave scores untouched.
+            analysis["category"] = analysis.get("category") or "Escalation Request"
+            log.info("[QA] System-failure phrase detected but bot escalated — not penalizing.")
     # ------------------------------------------------------------------
     # Finalise
     # ------------------------------------------------------------------
@@ -1303,7 +1382,7 @@ def _apply_qa_policy_rules(analysis: Dict[str, Any], turns: List[Dict[str, Any]]
     analysis["failed_parameters"] = list(dict.fromkeys(
         _compute_failed_parameters(analysis.get("scores", {})) + analysis.get("failed_parameters", [])
     ))
-    analysis["pass_fail"] = "FAIL" if analysis["failed_parameters"] or analysis.get("severity") == "fatal" else "PASS"
+    analysis = _restrict_failure_criteria(analysis)
     return analysis
 
 
@@ -1364,53 +1443,6 @@ def _collect_products_mentioned(
         _add(name)
 
     return out
-
-# def _collect_products_mentioned(
-#     analysis: Dict[str, Any],
-#     rag_hit: Dict[str, Any],
-#     transcript_text: str = "",
-# ) -> List[str]:
-#     """Merge every product the model/RAG/transcript-regex identified into an
-#     ordered, deduped list.
-
-#     Order priority:
-#       1. analysis["product_mentioned"] (primary, from GPT)
-#       2. analysis["products_mentioned"] (GPT-supplied list, if any)
-#       3. rag_hit["product"] (RAG top guess)
-#       4. each entry from rag_hit["secondary_products"] (in their order)
-#       5. each entry from rag_hit["all_product_scores"] (final fallback)
-#       6. NEW: any Bajaj product names extracted directly from the transcript
-#               text — covers products not present in the RAG index.
-#     """
-#     seen: set = set()
-#     out: List[str] = []
-
-#     def _add(name: Any):
-#         if not name:
-#             return
-#         s = _safe_filename_label(str(name)).strip()
-#         if not s or s.lower() == "none":
-#             return
-#         key = s.lower()
-#         if key in seen:
-#             return
-#         seen.add(key)
-#         out.append(s)
-
-#     _add(analysis.get("product_mentioned"))
-#     for p in (analysis.get("products_mentioned") or []):
-#         _add(p)
-#     _add((rag_hit or {}).get("product"))
-#     for sec in ((rag_hit or {}).get("secondary_products") or []):
-#         _add(sec.get("product"))
-#     for name in ((rag_hit or {}).get("all_product_scores") or {}).keys():
-#         _add(name)
-#     # NEW: transcript-extracted product names (e.g. "Bajaj Life Shield
-#     # Insurance Plan" when only Goal Suraksha specs are uploaded to RAG).
-#     for name in _extract_product_mentions_from_text(transcript_text or ""):
-#         _add(name)
-#     return out
-
 
 def _sentence_snippets(text: str, limit: int = 4) -> List[str]:
     sentences = re.split(r"(?<=[.!?])\s+", text or "")
@@ -1633,153 +1665,6 @@ def _load_rag_index():
         log.warning(f"FAISS index load failed: {e}")
         return None, []
 
-
-# def rebuild_product_rag_index() -> dict:
-#     """Build or rebuild the local product knowledge base.
-
-#     Optimisation: maintains a signature file at PROC_DIR / 'rag_signature.json'
-#     listing {file_name: sha1}. If every PDF/doc in the products folder still
-#     matches its previous sha1, we skip re-embedding entirely. Otherwise we
-#     re-embed only the chunks of changed files (cached embeddings for unchanged
-#     files are reused via PROC_DIR / 'embed_cache.npz').
-#     """
-#     files = _collect_product_files()
-#     meta_rows: List[Dict[str, Any]] = []
-
-#     if not files:
-#         if RAG_INDEX_FILE.exists():
-#             RAG_INDEX_FILE.unlink(missing_ok=True)
-#         RAG_META_FILE.write_text("[]")
-#         _save_rag_backend("empty")
-#         # also clear cached signature so a future upload triggers a rebuild
-#         sig_path = PROC_DIR / "rag_signature.json"
-#         if sig_path.exists():
-#             sig_path.unlink(missing_ok=True)
-#         return {"mode": "empty", "chunks": 0, "products": 0}
-
-#     # ---- 1. compute current signature ----
-#     sig_path = PROC_DIR / "rag_signature.json"
-#     embed_cache_path = PROC_DIR / "embed_cache.npz"
-#     current_sig: Dict[str, str] = {}
-#     for path in files:
-#         try:
-#             current_sig[path.name] = hashlib.sha1(path.read_bytes()).hexdigest()
-#         except Exception:
-#             current_sig[path.name] = f"{path.name}:{path.stat().st_size}"
-
-#     prev_sig: Dict[str, str] = {}
-#     try:
-#         prev_sig = json.loads(sig_path.read_text())
-#     except Exception:
-#         prev_sig = {}
-
-#     everything_unchanged = (
-#         prev_sig == current_sig
-#         and RAG_INDEX_FILE.exists()
-#         and RAG_META_FILE.exists()
-#         and embed_cache_path.exists()
-#     )
-#     if everything_unchanged:
-#         log.info("RAG index already up to date — skipping re-embed.")
-#         meta = _load_rag_meta()
-#         return {
-#             "mode": (json.loads(RAG_BACKEND_FILE.read_text()).get("mode", "faiss")
-#                      if RAG_BACKEND_FILE.exists() else "faiss"),
-#             "chunks": len(meta),
-#             "products": len(files),
-#             "cache": "hit",
-#         }
-
-#     # ---- 2. load existing embedding cache (key: sha1(chunk text)) ----
-#     embed_cache: Dict[str, np.ndarray] = {}
-#     if embed_cache_path.exists():
-#         try:
-#             with np.load(str(embed_cache_path), allow_pickle=False) as npz:
-#                 # store as one matrix + key list, keyed by sha1 strings
-#                 cache_keys = npz["keys"].tolist() if "keys" in npz else []
-#                 cache_mat = npz["vecs"] if "vecs" in npz else np.zeros((0, 0))
-#                 for i, k in enumerate(cache_keys):
-#                     embed_cache[k] = cache_mat[i]
-#             log.info(f"Loaded {len(embed_cache)} cached embeddings.")
-#         except Exception as e:
-#             log.warning(f"Embed cache load failed (rebuilding): {e}")
-#             embed_cache = {}
-
-#     try:
-#         model = _load_embedder()  # ensures model is loaded once
-#         chunk_texts: List[str] = []
-#         chunk_keys: List[str] = []
-#         for path in files:
-#             doc_text = _document_text(path)
-#             if not doc_text.strip():
-#                 continue
-#             chunks = _chunk_text(doc_text)
-#             product_label = _safe_filename_label(path.name)
-#             for chunk_idx, chunk in enumerate(chunks):
-#                 chunk_texts.append(chunk)
-#                 chunk_keys.append(hashlib.sha1(chunk.encode("utf-8")).hexdigest())
-#                 meta_rows.append({
-#                     "source": path.name,
-#                     "path": str(path),
-#                     "product": product_label,
-#                     "chunk_index": chunk_idx,
-#                     "text": chunk,
-#                     "word_count": len(chunk.split()),
-#                     "page": None,
-#                 })
-
-#         if not chunk_texts:
-#             RAG_META_FILE.write_text("[]")
-#             _save_rag_backend("empty")
-#             sig_path.write_text(json.dumps(current_sig, indent=2))
-#             return {"mode": "empty", "chunks": 0, "products": len(files)}
-
-#         # ---- 3. only embed chunks we don't already have ----
-#         missing_idx = [i for i, k in enumerate(chunk_keys) if k not in embed_cache]
-#         if missing_idx:
-#             log.info(f"Embedding {len(missing_idx)} new chunks (cached: {len(chunk_keys) - len(missing_idx)}).")
-#             new_vecs = _embed_texts([chunk_texts[i] for i in missing_idx])
-#             for vec, i in zip(new_vecs, missing_idx):
-#                 embed_cache[chunk_keys[i]] = vec.astype(np.float32)
-#         else:
-#             log.info("All chunks already cached — no embedding calls made.")
-
-#         # Materialise the full vector matrix in the right order
-#         vectors = np.vstack([embed_cache[k] for k in chunk_keys]).astype(np.float32)
-
-#         if faiss is not None:
-#             index = faiss.IndexFlatIP(vectors.shape[1])
-#             index.add(vectors)
-#             faiss.write_index(index, str(RAG_INDEX_FILE))
-#             _save_rag_backend("faiss")
-#         else:
-#             RAG_INDEX_FILE.write_text("")
-#             _save_rag_backend("keyword")
-
-#         RAG_META_FILE.write_text(json.dumps(meta_rows, indent=2, default=str))
-
-#         # ---- 4. persist signature + cache ----
-#         sig_path.write_text(json.dumps(current_sig, indent=2))
-#         try:
-#             keys_arr = np.array(list(embed_cache.keys()))
-#             vecs_arr = np.vstack(list(embed_cache.values())).astype(np.float32)
-#             np.savez_compressed(str(embed_cache_path), keys=keys_arr, vecs=vecs_arr)
-#         except Exception as e:
-#             log.warning(f"Embed cache write failed: {e}")
-
-#         return {
-#             "mode": "faiss" if faiss is not None else "keyword",
-#             "chunks": len(meta_rows),
-#             "products": len(files),
-#             "cache": "partial" if missing_idx else "full",
-#             "embedded_now": len(missing_idx),
-#         }
-#     except Exception as e:
-#         log.warning(f"Product RAG rebuild failed: {e}")
-#         RAG_META_FILE.write_text("[]")
-#         _save_rag_backend("keyword")
-#         return {"mode": "keyword", "chunks": 0, "products": len(files), "error": str(e)}
-
 def rebuild_product_rag_index() -> dict:
     files = _collect_product_files()
     meta_rows: List[Dict[str, Any]] = []
@@ -1944,130 +1829,6 @@ def search_product_rag(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         row["score"] = float(max(0.0, 1.0 - i * 0.1))
     set_cache(cache_key, ranked)
     return ranked
-
-
-# def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any]:
-#     """Infer the likely product and retrieve supporting chunks from the transcript itself."""
-#     query = re.sub(r"\s+", " ", transcript_text or "").strip()
-#     if not query:
-#         return {"product": "None", "context": "", "chunks": []}
-
-#     # Check cache first
-#     cache_key = f"product_context:{hashlib.md5(query.encode()).hexdigest()}"
-#     cached = get_cache(cache_key)
-#     if cached is not None:
-#         return cached
-
-#     rows = search_product_rag(query, top_k=max(top_k, 8))
-#     meta_rows = _load_rag_meta()
-#     catalog = _build_product_catalog(meta_rows) if meta_rows else []
-
-#     if not rows and not catalog:
-#         result = {"product": "None", "context": "", "chunks": []}
-#         set_cache(cache_key, result)
-#         return result
-
-#     transcript_tokens = set(_tokenize(query))
-#     product_scores = defaultdict(float)
-#     product_evidence = defaultdict(list)
-#     product_matches = defaultdict(set)
-
-#     for rank, row in enumerate(rows):
-#         product = row.get("product", "Unknown")
-#         score = float(row.get("score", 0.0))
-#         product_scores[product] += max(score, 0.0) + (0.05 * (len(rows) - rank))
-#         product_evidence[product].append(row)
-
-#     for profile in catalog:
-#         product = profile["product"]
-#         top_terms = set(profile.get("top_terms", []))
-#         overlap = transcript_tokens.intersection(top_terms)
-#         if overlap:
-#             product_scores[product] += 0.12 * len(overlap)
-#             product_matches[product].update(sorted(overlap))
-
-#         for feature, keywords in PRODUCT_FEATURE_KEYWORDS.items():
-#             if any(keyword in query.lower() for keyword in keywords):
-#                 if feature in profile.get("feature_hits", {}):
-#                     product_scores[product] += 0.35 + 0.05 * float(profile.get("feature_hits", {}).get(feature, 0))
-#                     product_matches[product].add(feature)
-
-#     if not product_scores:
-#         result = {"product": "None", "context": "", "chunks": []}
-#         set_cache(cache_key, result)
-#         return result
-
-#     best_product, best_score = max(product_scores.items(), key=lambda item: item[1])
-#     best_profile = next((p for p in catalog if p["product"] == best_product), {})
-#     supporting_rows = sorted(product_evidence.get(best_product, []), key=lambda row: row.get("score", 0.0), reverse=True)[:top_k]
-#     context_lines = []
-#     for row in supporting_rows:
-#         context_lines.append(
-#             f"[{row.get('product', 'Unknown')} | {row.get('source', 'spec')} | chunk {row.get('chunk_index', 0)}] {row.get('text', '')}"
-#         )
-
-#     if best_profile:
-#         context_lines.append(
-#             f"[PROFILE | {best_profile.get('product', 'Unknown')}] Summary: {best_profile.get('summary', '')}\n"
-#             f"Feature anchors: {', '.join(sorted(best_profile.get('feature_hits', {}).keys())[:8]) or 'None'}"
-#         )
-
-#     evidence_terms = sorted(product_matches.get(best_product, set()))[:12]
-#     confidence = round(float(best_score), 3)
-#     product_confidence = min(0.99, 0.4 + confidence / 4.0)
-
-#     # ------------------------------------------------------------------
-#     # Multi-product detection: if more than one product scored close to the top,
-#     # surface them all so downstream checks compare against the correct spec
-#     # rather than only the single highest match.
-#     # ------------------------------------------------------------------
-#     secondary_products: List[Dict[str, Any]] = []
-#     threshold_score = best_score * 0.55  # within 55% of the top score
-#     transcript_lower = (query or "").lower()
-#     for prod, score in product_scores.items():
-#         if prod == best_product:
-#             continue
-#         # Surface a secondary product if EITHER it scores close to the top
-#         # OR its label appears in the transcript verbatim (explicit mention).
-#         explicit_mention = bool(prod) and prod.lower() in transcript_lower
-#         if score >= threshold_score or explicit_mention:
-#             sec_profile = next((p for p in catalog if p["product"] == prod), {})
-#             sec_rows = sorted(
-#                 product_evidence.get(prod, []),
-#                 key=lambda r: r.get("score", 0.0),
-#                 reverse=True,
-#             )[:max(2, top_k // 2)]
-#             secondary_products.append({
-#                 "product": prod,
-#                 "score": round(float(score), 3),
-#                 "explicit_mention": explicit_mention,
-#                 "evidence": sec_rows,
-#                 "profile": sec_profile,
-#             })
-#             # Append a context section so the LLM sees both specs
-#             for row in sec_rows:
-#                 context_lines.append(
-#                     f"[SECONDARY | {row.get('product', 'Unknown')} | {row.get('source', 'spec')} | chunk {row.get('chunk_index', 0)}] {row.get('text', '')}"
-#                 )
-
-#     secondary_products.sort(key=lambda x: (-int(x["explicit_mention"]), -x["score"]))
-#     secondary_products = secondary_products[:3]
-
-#     # Lower threshold from 0.15 to 0.08 for better product detection
-#     result = {
-#         "product": best_product if best_score > 0.08 else "None",
-#         "confidence": round(product_confidence, 3),
-#         "matched_terms": evidence_terms,
-#         "catalog": catalog[:6],
-#         "evidence": supporting_rows,
-#         "context": "\n\n".join(context_lines),
-#         "chunks": supporting_rows,
-#         "profile": best_profile,
-#         "secondary_products": secondary_products,
-#         "all_product_scores": {p: round(float(s), 3) for p, s in sorted(product_scores.items(), key=lambda x: -x[1])[:6]},
-#     }
-#     set_cache(cache_key, result)
-#     return result
 
 def infer_product_context(transcript_text: str, top_k: int = 5) -> Dict[str, Any]:
     query = re.sub(r"\s+", " ", transcript_text or "").strip()
@@ -2443,7 +2204,12 @@ def extract_from_json(path: Path) -> List[Dict[str, str]]:
 
 SYSTEM_PROMPT = """You are an expert quality assurance analyst for Bajaj Life Insurance's AI-powered customer service bot. 
 Your role is to evaluate call transcripts between the BOT and customers with extreme precision and professional rigor.
-
+IMPORTANT — you are running as a smaller, faster model. Be literal and conservative:
+- If the bot escalates, transfers, or offers a callback after saying it cannot do something, this is a SUCCESSFUL resolution via escalation — do NOT flag behavior_issue or system_failure, and do NOT lower system_behaviour/resolution scores for this reason.
+- Only use flags ["false_information"] if you can quote the exact contradicting product-spec sentence.
+- Only use flags ["behavior_issue"] or "system_failure" if the bot failed to provide requested information AND did not escalate/transfer/offer callback.
+- If a product name is stated verbatim anywhere in the transcript, you MUST set product_mentioned to that exact name — do not substitute a different product even if spec context seems to favor another.
+- pass_fail should be "FAIL" only if: system_failure occurred with no escalation, OR false_information occurred, OR communication_quality score is below 3 (rude/unclear). Low scores on other parameters alone do not justify FAIL.
 You will evaluate each call on 10 parameters and provide JSON output ONLY — no prose outside the JSON.
 
 You must think like a strict insurance QA lead, not a generic chatbot. Use the transcript, customer intent, and product knowledge context together to infer which product is being discussed even when the product name is not spoken explicitly. Product identification must rely on product details, feature language, policy behavior, and benefit structure.
@@ -2682,7 +2448,35 @@ def _mock_analysis(turns: List[Dict]) -> Dict:
         "customer_turns": sum(1 for t in turns if t.get("speaker") in ["customer","user"]),
         "estimated_duration_minutes": round(len(turns) * 0.5, 1)
     }
+def _pick_best_product_name(
+    explicitly_mentioned_set: set,
+    gpt_product: str,
+    rag_hit: Dict[str, Any],
+) -> str:
+    """Resolve the final product_mentioned value deterministically instead of
+    using next(iter(set)) on an unordered set, which previously caused
+    arbitrary/wrong product names to win when multiple candidates existed."""
+    if not explicitly_mentioned_set:
+        if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+            return gpt_product
+        rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+        return rag_product if rag_product.lower() not in {"none", "unknown"} else "None"
 
+    if gpt_product in explicitly_mentioned_set:
+        return gpt_product
+
+    if len(explicitly_mentioned_set) == 1:
+        return next(iter(explicitly_mentioned_set))
+
+    # Multiple distinct explicit candidates — rank by RAG score so the one
+    # actually discussed (highest evidence) wins, not an arbitrary pick.
+    all_scores = rag_hit.get("all_product_scores") or {}
+    ranked = sorted(
+        explicitly_mentioned_set,
+        key=lambda name: all_scores.get(name, 0.0),
+        reverse=True,
+    )
+    return ranked[0]
 # ── Processing Pipeline ──────────────────────────────────────────────────────
 async def process_realtime_call(job_id: str, item: dict):
     update_job(job_id, status="processing")
@@ -2702,27 +2496,62 @@ async def process_realtime_call(job_id: str, item: dict):
             product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
  
         analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
+        # Defensive normalization — 4o-mini is less consistent with types than 4o.
+        if not isinstance(analysis.get("flags"), list):
+            analysis["flags"] = [analysis["flags"]] if analysis.get("flags") else []
+        if not isinstance(analysis.get("failed_parameters"), list):
+            analysis["failed_parameters"] = []
+        if not isinstance(analysis.get("scores"), dict):
+            analysis["scores"] = {}
+        if not isinstance(analysis.get("product_checks"), list):
+            analysis["product_checks"] = []
  
+        # explicitly_mentioned_set = set(
+        #     _safe_filename_label(p)
+        #     for p in (rag_hit.get("explicitly_mentioned") or [])
+        # ) | set(
+        #     _safe_filename_label(p)
+        #     for p in _extract_product_mentions_from_text(item["text"] or "")
+        # )
+        # gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
+        # if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+        #     analysis["product_mentioned"] = gpt_product
+        # elif explicitly_mentioned_set:
+        #     analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
+        # else:
+        #     rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+        #     if rag_product and rag_product.lower() not in {"none", "unknown"} \
+        #             and rag_product.lower() in (item["text"] or "").lower():
+        #         analysis["product_mentioned"] = rag_product
+        #     else:
+        #         analysis["product_mentioned"] = "None"
         explicitly_mentioned_set = set(
-            _safe_filename_label(p)
-            for p in (rag_hit.get("explicitly_mentioned") or [])
+            _safe_filename_label(p) for p in (rag_hit.get("explicitly_mentioned") or [])
         ) | set(
-            _safe_filename_label(p)
-            for p in _extract_product_mentions_from_text(item["text"] or "")
+            _safe_filename_label(p) for p in _extract_product_mentions_from_text(item["text"] or "")
         )
         gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
-        if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
-            analysis["product_mentioned"] = gpt_product
-        elif explicitly_mentioned_set:
-            analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
-        else:
-            rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
-            if rag_product and rag_product.lower() not in {"none", "unknown"} \
-                    and rag_product.lower() in (item["text"] or "").lower():
-                analysis["product_mentioned"] = rag_product
-            else:
-                analysis["product_mentioned"] = "None"
- 
+
+        # if explicitly_mentioned_set:
+        #     # Transcript explicitly named a product — trust this over the model's guess,
+        #     # but prefer the model's pick IF it's actually inside the explicit set.
+        #     if gpt_product in explicitly_mentioned_set:
+        #         analysis["product_mentioned"] = gpt_product
+        #     else:
+        #         analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
+        # elif gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+        #     analysis["product_mentioned"] = gpt_product
+        # else:
+        #     rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+        #     if rag_product and rag_product.lower() not in {"none", "unknown"} \
+        #             and rag_product.lower() in (item["text"] or "").lower():
+        #         analysis["product_mentioned"] = rag_product
+        #     else:
+        #         analysis["product_mentioned"] = "None"
+        analysis["product_mentioned"] = _pick_best_product_name(
+            explicitly_mentioned_set, gpt_product, rag_hit
+        )
+        
         analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
         analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
         analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
@@ -2784,370 +2613,7 @@ async def process_realtime_call(job_id: str, item: dict):
         log.error(f"Realtime call processing error: {e}")
         update_job(job_id, status="completed", completed_at=datetime.now().isoformat())
  
-# async def process_realtime_call(job_id: str, item: dict):
-#     """Process a single real-time call item (already parsed)."""
-#     db = load_db()
-#     job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#     if job_idx is None:
-#         return
-#     db["jobs"][job_idx]["status"] = "processing"
-#     save_db(db)
 
-#     try:
-#         # Use pre-parsed turns if available, otherwise parse from text
-#         turns = item.get("turns") or parse_transcript_text(item["text"])
-#         meta = item.get("meta", {})
-
-#         rag_hit = infer_product_context(item["text"])
-#         product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
-#         detected_product = rag_hit.get("product", "None")
-#         if detected_product and detected_product != "None":
-#             product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
-
-#         analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
-#         analysis["weighted_score"] = _compute_weighted_score(analysis.get("scores", {}))
-
-
-#         # Fill product context fields so policy rules & best-spec lookup work correctly
-#         # if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
-#         #     analysis["product_mentioned"] = detected_product
-#         # analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
-#         # analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
-#         # AFTER — paste this in both process_realtime_call and process_job:
-#         explicitly_mentioned_set = set(
-#             _safe_filename_label(p)
-#             for p in (rag_hit.get("explicitly_mentioned") or [])
-#         ) | set(
-#             _safe_filename_label(p)
-#             for p in _extract_product_mentions_from_text(item["text"] or "")
-#         )
-
-#         gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
-
-#         if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
-#             # GPT named something — trust it
-#             analysis["product_mentioned"] = gpt_product
-#         elif explicitly_mentioned_set:
-#             # GPT said None but transcript clearly names a product we have a spec for
-#             analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
-#         else:
-#             # Last resort: use RAG best guess only if it literally appears in the transcript
-#             rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
-#             if rag_product and rag_product.lower() not in {"none", "unknown"} \
-#                     and rag_product.lower() in (item["text"] or "").lower():
-#                 analysis["product_mentioned"] = rag_product
-#             else:
-#                 analysis["product_mentioned"] = "None"
-
-#         analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
-#         analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
-#         analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
-#         analysis.setdefault("product_checks", [])
-#         analysis.setdefault("product_profile", rag_hit.get("profile", {}))
-#         analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
-#         analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
-#         analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
-
-#         # Sentiment refinement + QA safety-net rules (same as batch path)
-#         analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
-#         if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
-#             analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
-#         analysis = _apply_qa_policy_rules(analysis, turns)
-#         analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
-
-#         # --- Overlay voicebot metadata where available ---
-#         if meta.get("intent"):
-#             analysis["voicebot_intent"] = meta["intent"]
-#         if meta.get("summary") and meta["summary"].strip():
-#             analysis["summary"] = meta["summary"].strip()
-#         if meta.get("no_of_queries") is not None:
-#             analysis["no_of_queries"] = meta["no_of_queries"]
-#         if meta.get("no_of_queries_resolved") is not None:
-#             analysis["no_of_queries_resolved"] = meta["no_of_queries_resolved"]
-#         if meta.get("customer_journey"):
-#             analysis["customer_journey"] = meta["customer_journey"]
-#         if meta.get("standalone_type"):
-#             # Use voicebot's standalone_type as category if available
-#             analysis["category"] = meta["standalone_type"][0] if meta["standalone_type"] else analysis.get("category", "General Query")
-#             analysis["standalone_type"] = meta["standalone_type"]
-#         if meta.get("sub_query_type"):
-#             analysis["sub_query_type"] = meta["sub_query_type"]
-#         if meta.get("call_comp_flag"):
-#             analysis["call_comp_flag"] = meta["call_comp_flag"]
-#         if meta.get("audio_link"):
-#             analysis["audio_link"] = meta["audio_link"]
-            
-#         call_record = {
-#             "id": str(uuid.uuid4()),
-#             "job_id": job_id,
-#             "name": item["name"],
-#             "sl": item.get("sl", ""),
-#             "source_file": "realtime",
-#             "transcript": turns,
-#             "raw_text": item["text"][:5000],
-#             "analysis": analysis,
-#             "processed_at": datetime.now().isoformat(),
-#             "flagged": len(analysis.get("flags", [])) > 0,
-#             "fatal": analysis.get("severity") == "fatal"
-#         }
-
-#         db = load_db()
-#         db["calls"].append(call_record)
-#         job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#         if job_idx is not None:
-#             db["jobs"][job_idx]["processed"] = 1
-#             db["jobs"][job_idx]["status"] = "completed"
-#             db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-#             db["jobs"][job_idx]["fatal_count"] = 1 if call_record["fatal"] else 0
-#             db["jobs"][job_idx]["flag_count"] = 1 if call_record["flagged"] else 0
-#         save_db(db)
-
-#     except Exception as e:
-#         log.error(f"Realtime call processing error: {e}")
-#         db = load_db()
-#         job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#         if job_idx is not None:
-#             db["jobs"][job_idx]["status"] = "completed"
-#             db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-#         save_db(db)
-
-# async def process_job(job_id: str, file_paths: List[Path]):
-#     db = load_db()
-#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
-#     if not job:
-#         return
-    
-#     all_transcripts = []
-#     for fp in file_paths:
-#         try:
-#             items = extract_transcripts_from_file(fp)
-#             all_transcripts.extend(items)
-#         except Exception as e:
-#             log.error(f"File parse error {fp}: {e}")
-    
-#     job["total"] = len(all_transcripts)
-#     job["status"] = "processing"
-#     job["processed"] = 0
-#     save_db(db)
-    
-#     for item in all_transcripts:
-#         try:
-#             turns = parse_transcript_text(item["text"])
-
-#             # RAG product lookup from the transcript itself, even if the product name is not mentioned.
-#             rag_hit = infer_product_context(item["text"])
-#             product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
-#             detected_product = rag_hit.get("product", "None")
-#             if detected_product and detected_product != "None":
-#                 product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
-
-#             analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
-#             # analysis.setdefault("product_mentioned", detected_product)
-#             # if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
-#             #     analysis["product_mentioned"] = detected_product
-#             # analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
-#             # analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
-            
-#             # AFTER — paste this in both process_realtime_call and process_job:
-#             explicitly_mentioned_set = set(
-#                 _safe_filename_label(p)
-#                 for p in (rag_hit.get("explicitly_mentioned") or [])
-#             ) | set(
-#                 _safe_filename_label(p)
-#                 for p in _extract_product_mentions_from_text(item["text"] or "")
-#             )
-
-#             gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
-
-#             if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
-#                 # GPT named something — trust it
-#                 analysis["product_mentioned"] = gpt_product
-#             elif explicitly_mentioned_set:
-#                 # GPT said None but transcript clearly names a product we have a spec for
-#                 analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
-#             else:
-#                 # Last resort: use RAG best guess only if it literally appears in the transcript
-#                 rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
-#                 if rag_product and rag_product.lower() not in {"none", "unknown"} \
-#                         and rag_product.lower() in (item["text"] or "").lower():
-#                     analysis["product_mentioned"] = rag_product
-#                 else:
-#                     analysis["product_mentioned"] = "None"
-
-#             analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
-#             analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
-#             analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
-#             analysis.setdefault("product_checks", [])
-#             analysis.setdefault("product_profile", rag_hit.get("profile", {}))
-#             analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
-#             analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
-#             analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
-#             analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
-#             if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
-#                 analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
-#             analysis = _apply_qa_policy_rules(analysis, turns)
-#             analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
-            
-#             call_record = {
-#                 "id": str(uuid.uuid4()),
-#                 "job_id": job_id,
-#                 "name": item["name"],
-#                 "sl": item.get("sl", ""),
-#                 "source_file": item.get("source_file", ""),
-#                 "transcript": turns if turns else [{"sl":1,"speaker":"unknown","text":item["text"][:2000]}],
-#                 "raw_text": item["text"][:5000],
-#                 "analysis": analysis,
-#                 "processed_at": datetime.now().isoformat(),
-#                 "flagged": len(analysis.get("flags", [])) > 0,
-#                 "fatal": analysis.get("severity") == "fatal"
-#             }
-            
-#             db = load_db()
-#             db["calls"].append(call_record)
-#             job_idx = next((i for i,j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#             if job_idx is not None:
-#                 db["jobs"][job_idx]["processed"] = db["jobs"][job_idx].get("processed", 0) + 1
-#                 db["jobs"][job_idx]["fatal_count"] = db["jobs"][job_idx].get("fatal_count", 0) + (1 if call_record["fatal"] else 0)
-#                 db["jobs"][job_idx]["flag_count"] = db["jobs"][job_idx].get("flag_count", 0) + (1 if call_record["flagged"] else 0)
-#             save_db(db)
-            
-#         except Exception as e:
-#             log.error(f"Call processing error: {e}")
-    
-#     db = load_db()
-#     job_idx = next((i for i,j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#     if job_idx is not None:
-#         db["jobs"][job_idx]["status"] = "completed"
-#         db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-#     save_db(db)
-# async def process_job(job_id: str, file_paths: List[Path]):
-#     db = load_db()
-#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
-#     if not job:
-#         return
-
-#     all_transcripts = []
-#     for fp in file_paths:
-#         try:
-#             items = extract_transcripts_from_file(fp)
-#             all_transcripts.extend(items)
-#         except Exception as e:
-#             log.error(f"File parse error {fp}: {e}")
-
-#     job["total"] = len(all_transcripts)
-#     job["status"] = "processing"
-#     job["processed"] = 0
-#     save_db(db)
-
-#     for item in all_transcripts:
-
-#         # ── Signal check BEFORE each GPT call ────────────────────────────────
-#         signal = check_job_signal(job_id)
-
-#         if signal == "cancel":
-#             clear_job_signal(job_id)
-#             db = load_db()
-#             job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#             if job_idx is not None:
-#                 db["jobs"][job_idx]["status"] = "cancelled"
-#                 db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-#             save_db(db)
-#             log.info(f"Job {job_id} cancelled")
-#             return   # exits the entire function immediately
-
-#         if signal == "pause":
-#             clear_job_signal(job_id)
-#             db = load_db()
-#             job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#             if job_idx is not None:
-#                 db["jobs"][job_idx]["status"] = "paused"
-#             save_db(db)
-#             log.info(f"Job {job_id} paused — waiting for resume")
-#             while True:
-#                 await asyncio.sleep(2)
-#                 wake = check_job_signal(job_id)
-#                 if wake == "cancel":
-#                     clear_job_signal(job_id)
-#                     db = load_db()
-#                     job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#                     if job_idx is not None:
-#                         db["jobs"][job_idx]["status"] = "cancelled"
-#                         db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-#                     save_db(db)
-#                     return
-#                 if wake == "resume":
-#                     clear_job_signal(job_id)
-#                     db = load_db()
-#                     job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#                     if job_idx is not None:
-#                         db["jobs"][job_idx]["status"] = "processing"
-#                     save_db(db)
-#                     log.info(f"Job {job_id} resumed")
-#                     break
-#         # ── end signal check — now do the actual GPT work ────────────────────
-
-#         try:
-#             turns = parse_transcript_text(item["text"])
-#             rag_hit = infer_product_context(item["text"])
-#             product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
-#             detected_product = rag_hit.get("product", "None")
-#             if detected_product and detected_product != "None":
-#                 product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
-
-#             analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
-#             analysis["weighted_score"] = _compute_weighted_score(analysis.get("scores", {}))
-#             analysis.setdefault("product_mentioned", detected_product)
-#             if not analysis.get("product_mentioned") or analysis.get("product_mentioned") == "None":
-#                 analysis["product_mentioned"] = detected_product
-#             analysis["product_mentioned"] = _safe_filename_label(str(analysis.get("product_mentioned", "None")))
-#             analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
-#             analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
-#             analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
-#             analysis.setdefault("product_checks", [])
-#             analysis.setdefault("product_profile", rag_hit.get("profile", {}))
-#             analysis.setdefault("product_evidence", rag_hit.get("chunks", []))
-#             analysis.setdefault("secondary_products", rag_hit.get("secondary_products", []))
-#             analysis.setdefault("all_product_scores", rag_hit.get("all_product_scores", {}))
-#             analysis["sentiment"] = _refine_sentiment(turns, analysis.get("sentiment", "neutral"))
-#             if not analysis.get("param_comments") or len(analysis.get("param_comments", [])) < len(PARAM_ORDER):
-#                 analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
-#             analysis = _apply_qa_policy_rules(analysis, turns)
-#             analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
-
-#             call_record = {
-#                 "id": str(uuid.uuid4()),
-#                 "job_id": job_id,
-#                 "name": item["name"],
-#                 "sl": item.get("sl", ""),
-#                 "source_file": item.get("source_file", ""),
-#                 "transcript": turns if turns else [{"sl": 1, "speaker": "unknown", "text": item["text"][:2000]}],
-#                 "raw_text": item["text"][:5000],
-#                 "analysis": analysis,
-#                 "processed_at": datetime.now().isoformat(),
-#                 "flagged": len(analysis.get("flags", [])) > 0,
-#                 "fatal": analysis.get("severity") == "fatal"
-#             }
-
-#             db = load_db()
-#             db["calls"].append(call_record)
-#             job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#             if job_idx is not None:
-#                 db["jobs"][job_idx]["processed"] = db["jobs"][job_idx].get("processed", 0) + 1
-#                 db["jobs"][job_idx]["fatal_count"] = db["jobs"][job_idx].get("fatal_count", 0) + (1 if call_record["fatal"] else 0)
-#                 db["jobs"][job_idx]["flag_count"] = db["jobs"][job_idx].get("flag_count", 0) + (1 if call_record["flagged"] else 0)
-#             save_db(db)
-
-#         except Exception as e:
-#             log.error(f"Call processing error: {e}")
-
-#     db = load_db()
-#     job_idx = next((i for i, j in enumerate(db["jobs"]) if j["id"] == job_id), None)
-#     if job_idx is not None:
-#         # Only mark completed if not already cancelled
-#         if db["jobs"][job_idx].get("status") not in {"cancelled", "paused"}:
-#             db["jobs"][job_idx]["status"] = "completed"
-#             db["jobs"][job_idx]["completed_at"] = datetime.now().isoformat()
-#     save_db(db)
 async def process_job(job_id: str, file_paths: List[Path]):
     job = get_job(job_id)
     if not job:
@@ -3203,26 +2669,61 @@ async def process_job(job_id: str, file_paths: List[Path]):
                 product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
  
             analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
+            # Defensive normalization — 4o-mini is less consistent with types than 4o.
+            if not isinstance(analysis.get("flags"), list):
+                analysis["flags"] = [analysis["flags"]] if analysis.get("flags") else []
+            if not isinstance(analysis.get("failed_parameters"), list):
+                analysis["failed_parameters"] = []
+            if not isinstance(analysis.get("scores"), dict):
+                analysis["scores"] = {}
+            if not isinstance(analysis.get("product_checks"), list):
+                analysis["product_checks"] = []
  
+            # explicitly_mentioned_set = set(
+            #     _safe_filename_label(p)
+            #     for p in (rag_hit.get("explicitly_mentioned") or [])
+            # ) | set(
+            #     _safe_filename_label(p)
+            #     for p in _extract_product_mentions_from_text(item["text"] or "")
+            # )
+            # gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
+            # if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+            #     analysis["product_mentioned"] = gpt_product
+            # elif explicitly_mentioned_set:
+            #     analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
+            # else:
+            #     rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+            #     if rag_product and rag_product.lower() not in {"none", "unknown"} \
+            #             and rag_product.lower() in (item["text"] or "").lower():
+            #         analysis["product_mentioned"] = rag_product
+            #     else:
+            #         analysis["product_mentioned"] = "None"
             explicitly_mentioned_set = set(
-                _safe_filename_label(p)
-                for p in (rag_hit.get("explicitly_mentioned") or [])
+                _safe_filename_label(p) for p in (rag_hit.get("explicitly_mentioned") or [])
             ) | set(
-                _safe_filename_label(p)
-                for p in _extract_product_mentions_from_text(item["text"] or "")
+                _safe_filename_label(p) for p in _extract_product_mentions_from_text(item["text"] or "")
             )
             gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
-            if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
-                analysis["product_mentioned"] = gpt_product
-            elif explicitly_mentioned_set:
-                analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
-            else:
-                rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
-                if rag_product and rag_product.lower() not in {"none", "unknown"} \
-                        and rag_product.lower() in (item["text"] or "").lower():
-                    analysis["product_mentioned"] = rag_product
-                else:
-                    analysis["product_mentioned"] = "None"
+
+            # if explicitly_mentioned_set:
+            #     # Transcript explicitly named a product — trust this over the model's guess,
+            #     # but prefer the model's pick IF it's actually inside the explicit set.
+            #     if gpt_product in explicitly_mentioned_set:
+            #         analysis["product_mentioned"] = gpt_product
+            #     else:
+            #         analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
+            # elif gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
+            #     analysis["product_mentioned"] = gpt_product
+            # else:
+            #     rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
+            #     if rag_product and rag_product.lower() not in {"none", "unknown"} \
+            #             and rag_product.lower() in (item["text"] or "").lower():
+            #         analysis["product_mentioned"] = rag_product
+            #     else:
+            #         analysis["product_mentioned"] = "None"
+            analysis["product_mentioned"] = _pick_best_product_name(
+                explicitly_mentioned_set, gpt_product, rag_hit
+            )
  
             analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
             analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
@@ -3531,18 +3032,6 @@ async def delete_all_product_specs():
     remove_all_product_specs()
     return {"message": "All product specs removed"}
 
-# @app.get("/api/jobs")
-# async def get_jobs():
-#     db = load_db()
-#     return db["jobs"]
-
-# @app.get("/api/jobs/{job_id}")
-# async def get_job(job_id: str):
-#     db = load_db()
-#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
-#     if not job:
-#         raise HTTPException(404, "Job not found")
-#     return job
 @app.get("/api/jobs")
 async def get_jobs():
     return list_jobs()
@@ -3554,93 +3043,7 @@ async def get_job_endpoint(job_id: str):
         raise HTTPException(404, "Job not found")
     return job
 
-# @app.get("/api/calls")
-# async def get_calls(
-#     page: int = Query(1, ge=1),
-#     page_size: int = Query(50, ge=1, le=500),
-#     severity: Optional[str] = None,
-#     category: Optional[str] = None,
-#     sentiment: Optional[str] = None,
-#     pass_fail: Optional[str] = None,
-#     flagged: Optional[bool] = None,
-#     search: Optional[str] = None,
-#     job_id: Optional[str] = None,
-#     sort_by: str = "processed_at",
-#     sort_dir: str = "desc"
-# ):
-#     db = load_db()
-#     calls = db["calls"]
-    
-#     # Filters
-#     if severity:
-#         calls = [c for c in calls if c["analysis"].get("severity") == severity]
-#     if category:
-#         calls = [c for c in calls if c["analysis"].get("category") == category]
-#     if sentiment:
-#         calls = [c for c in calls if c["analysis"].get("sentiment") == sentiment]
-#     if pass_fail:
-#         calls = [c for c in calls if c["analysis"].get("pass_fail") == pass_fail]
-#     if flagged is not None:
-#         calls = [c for c in calls if c.get("flagged") == flagged]
-#     if job_id:
-#         calls = [c for c in calls if c.get("job_id") == job_id]
-#     if search:
-#         s = search.lower()
-#         calls = [c for c in calls if s in c["name"].lower() or s in c.get("raw_text","").lower()]
-    
-#     total = len(calls)
-    
-#     # Sort
-#     reverse = sort_dir == "desc"
-#     if sort_by == "weighted_score":
-#         calls.sort(key=lambda c: c["analysis"].get("weighted_score", 0), reverse=reverse)
-#     elif sort_by == "processed_at":
-#         calls.sort(key=lambda c: c.get("processed_at",""), reverse=reverse)
-#     else:
-#         calls.sort(key=lambda c: c.get(sort_by,""), reverse=reverse)
-    
-#     # Paginate
-#     start = (page-1)*page_size
-#     page_calls = calls[start:start+page_size]
-    
-#     # Slim version for table view
-#     slim = []
-#     for c in page_calls:
-#         a = c["analysis"]
-#         if not a.get("param_comments") or len(a.get("param_comments", [])) < len(PARAM_ORDER):
-#             a["param_comments"] = _fallback_param_comments(a.get("scores", {}))
-#         if not a.get("annotated_transcript"):
-#             a["annotated_transcript"] = _annotate_transcript(c.get("transcript", []), a)
-#         a["sentiment"] = _refine_sentiment(c.get("transcript", []), a.get("sentiment", "neutral"))
-#         a = _apply_qa_policy_rules(a, c.get("transcript", []))
-#         a["product_mentioned"] = _safe_filename_label(str(a.get("product_mentioned") or "None"))
-#         c["analysis"] = a
-#         failed_parameters = a.get("failed_parameters", [])
-#         score_reason = a.get("score_reason") or _score_reason(a)
-#         slim.append({
-#             "id": c["id"],
-#             "name": c["name"],
-#             "sl": c.get("sl",""),
-#             "category": a.get("category",""),
-#             "severity": a.get("severity","normal"),
-#             "weighted_score": a.get("weighted_score",0),
-#             "pass_fail": a.get("pass_fail",""),
-#             "sentiment": a.get("sentiment",""),
-#             "flags": a.get("flags",[]),
-#             "product_mentioned": a.get("product_mentioned",""),
-#             "products_mentioned": a.get("products_mentioned", []),
-#             "product_confidence": a.get("product_confidence", 0.0),
-#             "product_signals": a.get("product_signals", []),
-#             "fatal": c.get("fatal",False),
-#             "flagged": c.get("flagged",False),
-#             "turn_count": a.get("turn_count",0),
-#             "estimated_duration_minutes": a.get("estimated_duration_minutes",0),
-#             "processed_at": c.get("processed_at","") ,
-#             "score_reason": score_reason,
-#             "failed_parameters": failed_parameters
-#         })
-    
-#     return {"calls": slim, "total": total, "page": page, "page_size": page_size}
+
 @app.get("/api/calls")
 async def get_calls(
     page: int = Query(1, ge=1),
@@ -3662,22 +3065,7 @@ async def get_calls(
         search=search, sort_by=sort_by, sort_dir=sort_dir,
     )
 
-# @app.get("/api/calls/{call_id}")
-# async def get_call_detail(call_id: str):
-#     db = load_db()
-#     call = next((c for c in db["calls"] if c["id"] == call_id), None)
-#     if not call:
-#         raise HTTPException(404, "Call not found")
-#     a = call.get("analysis", {})
-#     if not a.get("param_comments") or len(a.get("param_comments", [])) < len(PARAM_ORDER):
-#         a["param_comments"] = _fallback_param_comments(a.get("scores", {}))
-#     if not a.get("annotated_transcript"):
-#         a["annotated_transcript"] = _annotate_transcript(call.get("transcript", []), a)
-#     a["sentiment"] = _refine_sentiment(call.get("transcript", []), a.get("sentiment", "neutral"))
-#     a = _apply_qa_policy_rules(a, call.get("transcript", []))
-#     a["product_mentioned"] = _safe_filename_label(str(a.get("product_mentioned") or "None"))
-#     call["analysis"] = a
-#     return call
+
 # ── /api/calls/{call_id} ─────────────────────────────────────────────────────
 @app.get("/api/calls/{call_id}")
 async def get_call_detail(call_id: str):
@@ -3694,59 +3082,7 @@ async def get_call_detail(call_id: str):
     call["analysis"] = a
     return call
 
-# @app.get("/api/export/calls.xlsx")
-# async def export_calls_excel():
-#     db = load_db()
-#     rows = []
-#     for c in db.get("calls", []):
-#         a = c.get("analysis", {})
-#         scores = a.get("scores", {})
-#         rows.append({
-#             "id": c.get("id", ""),
-#             "job_id": c.get("job_id", ""),
-#             "name": c.get("name", ""),
-#             "sl": c.get("sl", ""),
-#             "processed_at": c.get("processed_at", ""),
-#             "pass_fail": a.get("pass_fail", ""),
-#             "severity": a.get("severity", ""),
-#             "category": a.get("category", ""),
-#             "sentiment": a.get("sentiment", ""),
-#             "weighted_score": a.get("weighted_score", 0),
-#             "score_reason": a.get("score_reason", ""),
-#             "failed_parameters": ", ".join(a.get("failed_parameters", [])),
-#             "flags": ", ".join(a.get("flags", [])),
-#             "product_mentioned": a.get("product_mentioned", ""),
-#             "products_mentioned": ", ".join(a.get("products_mentioned", []) or []),
-#             "product_confidence": a.get("product_confidence", 0),
-#             "product_signals": ", ".join(a.get("product_signals", [])),
-#             "product_accuracy_score": a.get("product_accuracy_score", ""),
-#             "product_issues": a.get("product_issues", ""),
-#             "strengths": a.get("strengths", ""),
-#             "summary": a.get("summary", ""),
-#             "qa_findings": " | ".join(f.get("text", "") for f in a.get("qa_findings", [])),
-#             "greeting_opening": scores.get("greeting_opening", ""),
-#             "query_understanding": scores.get("query_understanding", ""),
-#             "response_accuracy": scores.get("response_accuracy", ""),
-#             "communication_quality": scores.get("communication_quality", ""),
-#             "compliance": scores.get("compliance", ""),
-#             "personalisation": scores.get("personalisation", ""),
-#             "empathy_soft_skills": scores.get("empathy_soft_skills", ""),
-#             "resolution": scores.get("resolution", ""),
-#             "system_behaviour": scores.get("system_behaviour", ""),
-#             "closing_interaction": scores.get("closing_interaction", ""),
-#             "raw_text": c.get("raw_text", ""),
-#         })
 
-#     df = pd.DataFrame(rows)
-#     stream = io.BytesIO()
-#     with pd.ExcelWriter(stream, engine="openpyxl") as writer:
-#         df.to_excel(writer, index=False, sheet_name="calls")
-#     stream.seek(0)
-#     return StreamingResponse(
-#         stream,
-#         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-#         headers={"Content-Disposition": "attachment; filename=calls_export.xlsx"},
-#     )
 @app.get("/api/export/calls.xlsx")
 async def export_calls_excel():
     from db import db_cursor  # already imported but explicit here for clarity
@@ -3868,16 +3204,7 @@ async def export_call_report_pdf(call_id: str):
         headers={"Content-Disposition": f"attachment; filename=call_report_{call_id}.pdf"},
     )
 
-# @app.delete("/api/calls/{call_id}")
-# async def delete_call(call_id: str):
-#     db = load_db()
-#     calls = db.get("calls", [])
-#     before = len(calls)
-#     db["calls"] = [c for c in calls if c.get("id") != call_id]
-#     if len(db["calls"]) == before:
-#         raise HTTPException(404, "Call not found")
-#     save_db(db)
-#     return {"deleted": call_id, "message": "Call removed"}
+
 @app.delete("/api/calls/{call_id}")
 async def delete_call(call_id: str):
     deleted = delete_analyzed_call(call_id)
@@ -3885,97 +3212,10 @@ async def delete_call(call_id: str):
         raise HTTPException(404, "Call not found")
     return {"deleted": call_id, "message": "Call removed"}
 
-# @app.get("/api/dashboard")
-# async def get_dashboard():
-#     db = load_db()
-#     calls = db["calls"]
-#     if not calls:
-#         return {"total": 0, "message": "No calls processed yet"}
-    
-#     scores = [c["analysis"].get("weighted_score",0) for c in calls]
-#     severities = {}
-#     categories = {}
-#     sentiments = {}
-#     param_scores = {k:[] for k in ["greeting_opening","query_understanding","response_accuracy",
-#                                      "communication_quality","compliance","personalisation",
-#                                      "empathy_soft_skills","resolution","system_behaviour","closing_interaction"]}
-#     flags_count = {}
-#     daily_counts = {}
-#     product_counts = {}
-#     product_confidence = defaultdict(list)
-#     pass_count = fail_count = 0
-#     fatal_count = flagged_count = 0
-    
-#     for c in calls:
-#         a = c["analysis"]
-#         sev = a.get("severity","normal")
-#         severities[sev] = severities.get(sev,0)+1
-#         cat = a.get("category","Unknown")
-#         categories[cat] = categories.get(cat,0)+1
-#         sent = _refine_sentiment(c.get("transcript", []), a.get("sentiment","neutral"))
-#         sentiments[sent] = sentiments.get(sent,0)+1
-#         if a.get("pass_fail") == "PASS": pass_count += 1
-#         else: fail_count += 1
-#         if c.get("fatal"): fatal_count += 1
-#         if c.get("flagged"): flagged_count += 1
-#         product = _safe_filename_label(str(a.get("product_mentioned") or "None"))
-#         product_counts[product] = product_counts.get(product, 0) + 1
-#         if a.get("product_confidence") is not None:
-#             product_confidence[product].append(float(a.get("product_confidence") or 0))
-#         for f in a.get("flags",[]):
-#             flags_count[f] = flags_count.get(f,0)+1
-#         for k in param_scores:
-#             v = a.get("scores",{}).get(k)
-#             if v: param_scores[k].append(v)
-#         date_key = c.get("processed_at","")[:10]
-#         if date_key:
-#             daily_counts[date_key] = daily_counts.get(date_key,0)+1
-    
-#     avg_param = {k: round(sum(v)/len(v),2) if v else 0 for k,v in param_scores.items()}
-#     avg_product_confidence = {k: round(sum(v)/len(v), 3) if v else 0 for k, v in product_confidence.items()}
-    
-#     return {
-#         "total_calls": len(calls),
-#         "avg_score": round(sum(scores)/len(scores),2),
-#         "pass_rate": round(pass_count/len(calls)*100,1),
-#         "fail_count": fail_count,
-#         "fatal_count": fatal_count,
-#         "flagged_count": flagged_count,
-#         "severities": severities,
-#         "categories": categories,
-#         "sentiments": sentiments,
-#         "flags_breakdown": flags_count,
-#         "avg_parameter_scores": avg_param,
-#         "product_breakdown": dict(sorted(product_counts.items(), key=lambda item: item[1], reverse=True)),
-#         "avg_product_confidence": avg_product_confidence,
-#         "score_distribution": {
-#             "excellent": sum(1 for s in scores if s >= 85),
-#             "good": sum(1 for s in scores if 70 <= s < 85),
-#             "average": sum(1 for s in scores if 55 <= s < 70),
-#             "poor": sum(1 for s in scores if s < 55)
-#         },
-#         "daily_volume": dict(sorted(daily_counts.items())),
-#         "jobs_summary": {
-#             "total": len(db["jobs"]),
-#             "completed": sum(1 for j in db["jobs"] if j.get("status")=="completed"),
-#             "processing": sum(1 for j in db["jobs"] if j.get("status")=="processing"),
-#             "queued": sum(1 for j in db["jobs"] if j.get("status")=="queued")
-#         }
-#     }
+
 @app.get("/api/dashboard")
 async def get_dashboard():
     return get_dashboard_stats()
-# @app.post("/api/jobs/{job_id}/cancel")
-# async def cancel_job(job_id: str):
-#     db = load_db()
-#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
-#     if not job:
-#         raise HTTPException(404, "Job not found")
-#     status = job.get("status")
-#     if status in {"completed", "cancelled", "failed"}:
-#         raise HTTPException(400, f"Job is already {status}")
-#     signal_job(job_id, "cancel")
-#     return {"job_id": job_id, "signal": "cancel", "message": "Cancellation signal sent — will stop after current transcript"}
 
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
@@ -4007,55 +3247,11 @@ async def resume_job(job_id: str):
         raise HTTPException(400, f"Can only resume a paused job (current: {job.get('status')})")
     signal_job(job_id, "resume")
     return {"job_id": job_id, "signal": "resume", "message": "Resume signal sent"}
-    
-# @app.post("/api/jobs/{job_id}/pause")
-# async def pause_job(job_id: str):
-#     db = load_db()
-#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
-#     if not job:
-#         raise HTTPException(404, "Job not found")
-#     if job.get("status") != "processing":
-#         raise HTTPException(400, f"Can only pause a processing job (current: {job.get('status')})")
-#     signal_job(job_id, "pause")
-#     return {"job_id": job_id, "signal": "pause", "message": "Pause signal sent — will pause after current transcript"}
 
-
-# @app.post("/api/jobs/{job_id}/resume")
-# async def resume_job(job_id: str):
-#     db = load_db()
-#     job = next((j for j in db["jobs"] if j["id"] == job_id), None)
-#     if not job:
-#         raise HTTPException(404, "Job not found")
-#     if job.get("status") != "paused":
-#         raise HTTPException(400, f"Can only resume a paused job (current: {job.get('status')})")
-#     signal_job(job_id, "resume")
-#     return {"job_id": job_id, "signal": "resume", "message": "Resume signal sent"}
-# @app.get("/api/fatal-calls")
-# async def get_fatal_calls():
-#     db = load_db()
-#     fatals = [c for c in db["calls"] if c.get("fatal") or c["analysis"].get("severity") in ["fatal","critical"]]
-#     return [{
-#         "id": c["id"], "name": c["name"],
-#         "severity": c["analysis"].get("severity"),
-#         "fatal_reason": c["analysis"].get("fatal_reason",""),
-#         "flags": c["analysis"].get("flags",[]),
-#         "weighted_score": c["analysis"].get("weighted_score",0),
-#         "category": c["analysis"].get("category",""),
-#         "processed_at": c.get("processed_at","")
-#     } for c in fatals]
 @app.get("/api/fatal-calls")
 async def get_fatal_calls_endpoint():
     return db_get_fatal_calls()
-# @app.delete("/api/calls")
-# async def clear_all_calls():
-#     db = load_db()
-#     db["calls"] = []
-#     db["jobs"] = []
-#     save_db(db)
-#     for job_dir in UPLOAD_DIR.glob("*"):
-#         if job_dir.is_dir():
-#             shutil.rmtree(job_dir, ignore_errors=True)
-#     return {"message": "All data cleared"}
+
 @app.delete("/api/calls")
 async def clear_all_calls():
     clear_all_data()
