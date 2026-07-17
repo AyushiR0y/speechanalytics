@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: bajaj-life-speech-analytics
+    env: python
+    plan: starter
+    buildCommand: |
+      pip install -r requirements.txt &&
+      python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+    startCommand: python -m uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: RAG_EMBED_MODEL
+        value: all-MiniLM-L6-v2
+      - key: HF_HUB_DISABLE_SSL_VERIFICATION
+        value: "1"
+      # Set OPENAI_API_KEY (or AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT) in Render dashboard
+      # DATABASE_URL is optional — omit it to use local JSON-file storage
+    disk:
+      name: speech-analytics-data
+      mountPath: /opt/render/project/src/processed
+      sizeGB: 1
