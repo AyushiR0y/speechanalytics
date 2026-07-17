@@ -62,17 +62,19 @@ def _env(name: str, default: str = "") -> str:
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("speech_analytics")
 
-# OpenAI client (supports OpenAI and Azure OpenAI)
+# OpenAI async client (supports OpenAI and Azure OpenAI)
+# Using AsyncAzureOpenAI / AsyncOpenAI so that chat.completions.create() can be
+# properly awaited without blocking the event loop.
 if _env("AZURE_OPENAI_API_KEY") and _env("AZURE_OPENAI_ENDPOINT"):
     OPENAI_MODEL = _env("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
-    openai_client = openai.AzureOpenAI(
+    openai_client = openai.AsyncAzureOpenAI(
         api_key=_env("AZURE_OPENAI_API_KEY"),
         api_version=_env("AZURE_OPENAI_API_VERSION", "2024-02-01"),
         azure_endpoint=_env("AZURE_OPENAI_ENDPOINT")
     )
 else:
     OPENAI_MODEL = _env("OPENAI_MODEL", "gpt-4o")
-    openai_client = openai.OpenAI(api_key=_env("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY"))
+    openai_client = openai.AsyncOpenAI(api_key=_env("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY"))
 
 # ── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(title="Bajaj Life Insurance – Speech Analytics", version="1.0")
@@ -2367,14 +2369,15 @@ Treat product accuracy as a strict QA test: include exact call-vs-spec compariso
 Ensure param_comments contains exactly 10 entries in score order and each entry clearly explains the score using transcript evidence so it can be shown in hover tooltips."""
 
     try:
-        response = openai_client.chat.completions.create(
+        response = await openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg}
             ],
             temperature=0.0,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            timeout=120,
         )
         log_api_usage(OPENAI_MODEL, response.usage.prompt_tokens, response.usage.completion_tokens)
         raw = response.choices[0].message.content
@@ -2483,22 +2486,24 @@ def _pick_best_product_name(
     return ranked[0]
 # ── Processing Pipeline ──────────────────────────────────────────────────────
 async def process_realtime_call(job_id: str, item: dict):
-    update_job(job_id, status="processing")
- 
+    await asyncio.to_thread(update_job, job_id, status="processing")
+
     try:
         turns = item.get("turns") or parse_transcript_text(item["text"])
         meta  = item.get("meta", {})
         call_id = str(uuid.uuid4())
- 
-        # Store raw transcript immediately (Table 1)
-        insert_raw_call(call_id, job_id, item)
- 
-        rag_hit = infer_product_context(item["text"])
+
+        # Store raw transcript immediately (Table 1) — off event loop
+        await asyncio.to_thread(insert_raw_call, call_id, job_id, item)
+
+        # SentenceTransformer inference — CPU-bound; run in thread
+        rag_hit = await asyncio.to_thread(infer_product_context, item["text"])
         product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
         detected_product = rag_hit.get("product", "None")
         if detected_product and detected_product != "None":
             product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
- 
+
+        # GPT analysis — truly async
         analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
         # Defensive normalization — 4o-mini is less consistent with types than 4o.
         if not isinstance(analysis.get("flags"), list):
@@ -2603,77 +2608,79 @@ async def process_realtime_call(job_id: str, item: dict):
             "fatal":   is_fatal,
         }
  
-        # Store analysis result (Table 2)
-        upsert_analyzed_call(call_record)
- 
-        update_job(job_id,
+        # Store analysis result (Table 2) — off event loop
+        await asyncio.to_thread(upsert_analyzed_call, call_record)
+
+        await asyncio.to_thread(update_job, job_id,
                    status="completed",
                    processed=1,
                    fatal_count=1 if is_fatal else 0,
                    flag_count=1 if is_flagged else 0,
                    completed_at=datetime.now().isoformat())
- 
+
     except Exception as e:
-        log.error(f"Realtime call processing error: {e}")
-        update_job(job_id, status="completed", completed_at=datetime.now().isoformat())
+        log.error(f"Realtime call processing error: {e}", exc_info=True)
+        await asyncio.to_thread(update_job, job_id, status="completed", completed_at=datetime.now().isoformat())
  
 
 async def process_job(job_id: str, file_paths: List[Path]):
-    job = get_job(job_id)
+    job = await asyncio.to_thread(get_job, job_id)
     if not job:
         return
- 
+
     all_transcripts = []
     for fp in file_paths:
         try:
-            items = extract_transcripts_from_file(fp)
+            items = await asyncio.to_thread(extract_transcripts_from_file, fp)
             all_transcripts.extend(items)
         except Exception as e:
             log.error(f"File parse error {fp}: {e}")
- 
-    update_job(job_id, total=len(all_transcripts), status="processing", processed=0)
- 
+
+    await asyncio.to_thread(update_job, job_id, total=len(all_transcripts), status="processing", processed=0)
+
     for item in all_transcripts:
         signal = check_job_signal(job_id)
- 
+
         if signal == "cancel":
             clear_job_signal(job_id)
-            update_job(job_id, status="cancelled", completed_at=datetime.now().isoformat())
+            await asyncio.to_thread(update_job, job_id, status="cancelled", completed_at=datetime.now().isoformat())
             log.info(f"Job {job_id} cancelled")
             return
- 
+
         if signal == "pause":
             clear_job_signal(job_id)
-            update_job(job_id, status="paused")
+            await asyncio.to_thread(update_job, job_id, status="paused")
             log.info(f"Job {job_id} paused")
             while True:
                 await asyncio.sleep(2)
                 wake = check_job_signal(job_id)
                 if wake == "cancel":
                     clear_job_signal(job_id)
-                    update_job(job_id, status="cancelled", completed_at=datetime.now().isoformat())
+                    await asyncio.to_thread(update_job, job_id, status="cancelled", completed_at=datetime.now().isoformat())
                     return
                 if wake == "resume":
                     clear_job_signal(job_id)
-                    update_job(job_id, status="processing")
+                    await asyncio.to_thread(update_job, job_id, status="processing")
                     log.info(f"Job {job_id} resumed")
                     break
- 
+
         try:
             call_id = str(uuid.uuid4())
             turns   = parse_transcript_text(item["text"])
- 
-            # Store raw transcript (Table 1)
-            insert_raw_call(call_id, job_id, item)
- 
-            rag_hit = infer_product_context(item["text"])
+
+            # Store raw transcript (Table 1) — off event loop
+            await asyncio.to_thread(insert_raw_call, call_id, job_id, item)
+
+            # Product context — SentenceTransformer inference is CPU-bound; run in thread
+            rag_hit = await asyncio.to_thread(infer_product_context, item["text"])
             product_context = json.dumps(rag_hit, indent=2, ensure_ascii=False)
             detected_product = rag_hit.get("product", "None")
             if detected_product and detected_product != "None":
                 product_context = f"Detected product guess: {detected_product}\n\n{product_context}"
- 
+
+            # GPT analysis — truly async now (AsyncAzureOpenAI / AsyncOpenAI)
             analysis = await analyze_call_with_gpt4o(item["text"], turns, product_context)
-            # Defensive normalization — 4o-mini is less consistent with types than 4o.
+            # Defensive normalization
             if not isinstance(analysis.get("flags"), list):
                 analysis["flags"] = [analysis["flags"]] if analysis.get("flags") else []
             if not isinstance(analysis.get("failed_parameters"), list):
@@ -2682,26 +2689,7 @@ async def process_job(job_id: str, file_paths: List[Path]):
                 analysis["scores"] = {}
             if not isinstance(analysis.get("product_checks"), list):
                 analysis["product_checks"] = []
- 
-            # explicitly_mentioned_set = set(
-            #     _safe_filename_label(p)
-            #     for p in (rag_hit.get("explicitly_mentioned") or [])
-            # ) | set(
-            #     _safe_filename_label(p)
-            #     for p in _extract_product_mentions_from_text(item["text"] or "")
-            # )
-            # gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
-            # if gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
-            #     analysis["product_mentioned"] = gpt_product
-            # elif explicitly_mentioned_set:
-            #     analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
-            # else:
-            #     rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
-            #     if rag_product and rag_product.lower() not in {"none", "unknown"} \
-            #             and rag_product.lower() in (item["text"] or "").lower():
-            #         analysis["product_mentioned"] = rag_product
-            #     else:
-            #         analysis["product_mentioned"] = "None"
+
             explicitly_mentioned_set = set(
                 _safe_filename_label(p) for p in (rag_hit.get("explicitly_mentioned") or [])
             ) | set(
@@ -2709,26 +2697,10 @@ async def process_job(job_id: str, file_paths: List[Path]):
             )
             gpt_product = _safe_filename_label(str(analysis.get("product_mentioned") or "None"))
 
-            # if explicitly_mentioned_set:
-            #     # Transcript explicitly named a product — trust this over the model's guess,
-            #     # but prefer the model's pick IF it's actually inside the explicit set.
-            #     if gpt_product in explicitly_mentioned_set:
-            #         analysis["product_mentioned"] = gpt_product
-            #     else:
-            #         analysis["product_mentioned"] = next(iter(explicitly_mentioned_set))
-            # elif gpt_product and gpt_product.lower() not in {"none", "unknown", ""}:
-            #     analysis["product_mentioned"] = gpt_product
-            # else:
-            #     rag_product = _safe_filename_label(str(rag_hit.get("product") or "None"))
-            #     if rag_product and rag_product.lower() not in {"none", "unknown"} \
-            #             and rag_product.lower() in (item["text"] or "").lower():
-            #         analysis["product_mentioned"] = rag_product
-            #     else:
-            #         analysis["product_mentioned"] = "None"
             analysis["product_mentioned"] = _pick_best_product_name(
                 explicitly_mentioned_set, gpt_product, rag_hit
             )
- 
+
             analysis["products_mentioned"] = _collect_products_mentioned(analysis, rag_hit, item["text"])
             analysis.setdefault("product_confidence", rag_hit.get("confidence", 0.0))
             analysis.setdefault("product_signals", rag_hit.get("matched_terms", []))
@@ -2742,13 +2714,11 @@ async def process_job(job_id: str, file_paths: List[Path]):
                 analysis["param_comments"] = _fallback_param_comments(analysis.get("scores", {}))
             analysis = _apply_qa_policy_rules(analysis, turns)
             analysis["annotated_transcript"] = _annotate_transcript(turns, analysis)
-            # Always recompute score server-side
             analysis["weighted_score"] = _compute_weighted_score(analysis.get("scores", {}))
- 
-            # ── Derive fatal/flagged deterministically ────────────────────────
+
             is_fatal   = analysis.get("severity") in {"fatal", "critical"}
             is_flagged = len(analysis.get("flags", [])) > 0
- 
+
             call_record = {
                 "id": call_id,
                 "job_id": job_id,
@@ -2762,28 +2732,31 @@ async def process_job(job_id: str, file_paths: List[Path]):
                 "flagged": is_flagged,
                 "fatal":   is_fatal,
             }
- 
-            # Store analysis result (Table 2)
-            upsert_analyzed_call(call_record)
-            increment_job_counters(
-                job_id,
-                processed=1,
-                fatal=1 if is_fatal else 0,
-                flagged=1 if is_flagged else 0,
-            )
- 
+
+            # Store analysis result — off event loop
+            await asyncio.to_thread(upsert_analyzed_call, call_record)
+            await asyncio.to_thread(increment_job_counters, job_id,
+                                    1, 1 if is_fatal else 0, 1 if is_flagged else 0)
+
         except Exception as e:
-            log.error(f"Call processing error: {e}")
- 
-    job_now = get_job(job_id)
+            log.error(f"Call processing error [{item.get('name','?')}]: {e}", exc_info=True)
+            # still count as processed so progress bar advances
+            await asyncio.to_thread(increment_job_counters, job_id, 1, 0, 0)
+
+    job_now = await asyncio.to_thread(get_job, job_id)
     if job_now and job_now.get("status") not in {"cancelled", "paused"}:
-        update_job(job_id, status="completed", completed_at=datetime.now().isoformat())
+        await asyncio.to_thread(update_job, job_id, status="completed", completed_at=datetime.now().isoformat())
  
 # ── API Endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     return FileResponse(str(FRONTEND_DIR / "templates" / "index.html"))
+
+@app.head("/")
+async def head_root():
+    """Render health-check uses HEAD / — must return 200 not 405."""
+    return JSONResponse(content={}, status_code=200)
 
 @app.post("/api/upload")
 async def upload_files(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
