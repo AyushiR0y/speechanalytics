@@ -27,7 +27,10 @@ load_dotenv()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Try to load psycopg2 only when DATABASE_URL is present
+# Try to load psycopg2 only when DATABASE_URL is present, then verify the
+# connection is actually reachable.  If the DB is unreachable (e.g. the URL
+# points to an internal host not accessible from Render), fall back silently
+# to JSON-file mode so the app keeps working.
 # ─────────────────────────────────────────────────────────────────────────────
 _psycopg2 = None
 if DATABASE_URL:
@@ -36,9 +39,18 @@ if DATABASE_URL:
         import psycopg2.extras
         from psycopg2.extras import RealDictCursor
         _psycopg2 = psycopg2
-        log.info("db.py: PostgreSQL mode (DATABASE_URL detected)")
-    except ImportError:
-        log.warning("db.py: psycopg2 not installed – falling back to JSON mode")
+        # Quick reachability test with a short connect_timeout so we don't
+        # block startup for 30 s when the host is unreachable.
+        _test_conn = psycopg2.connect(DATABASE_URL + " connect_timeout=5",
+                                       cursor_factory=RealDictCursor)
+        _test_conn.close()
+        log.info("db.py: PostgreSQL mode — connection verified OK")
+    except Exception as _pg_err:
+        log.warning(
+            f"db.py: PostgreSQL unreachable ({_pg_err}). "
+            "Falling back to JSON-file mode."
+        )
+        _psycopg2 = None
         DATABASE_URL = ""
 else:
     log.info("db.py: JSON-file mode (no DATABASE_URL)")

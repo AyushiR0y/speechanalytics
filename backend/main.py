@@ -111,18 +111,13 @@ async def startup():
     clear_expired_cache()
     if not PRODUCT_INDEX_FILE.exists():
         PRODUCT_INDEX_FILE.write_text(json.dumps({"products": []}, indent=2))
-    # Verify DB connection on startup (PostgreSQL mode only)
+    # db.py already tested the connection at import time and fell back to
+    # JSON mode if PostgreSQL was unreachable — just log the active mode.
     from backend.db import DATABASE_URL as _DB_URL
     if _DB_URL:
-        try:
-            from backend.db import get_conn
-            conn = get_conn()
-            conn.close()
-            log.info("PostgreSQL connection OK")
-        except Exception as e:
-            log.error(f"PostgreSQL connection FAILED: {e}")
+        log.info("Persistence: PostgreSQL")
     else:
-        log.info("Running in JSON-file mode (no DATABASE_URL configured)")
+        log.info("Persistence: JSON-file mode (PostgreSQL not configured or unreachable)")
 
 # ── Database helpers ─────────────────────────────────────────────────────────
 def load_db() -> dict:
